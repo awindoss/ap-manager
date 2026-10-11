@@ -1,0 +1,25 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# --- Testing ---
+.pytest_cache/
+
+# --- Application runtime artifacts (see _mds/plan.md §5 / utils/constants.py) ---
+logs/
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+books/
+icons/
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

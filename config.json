@@ -1,0 +1,16 @@
+{
+    "pdf_reader": {
+        "path": ""
+    },
+
+    "ui": {
+        "window_width": 1200,
+        "window_height": 800,
+        "window_x": null,
+        "window_y": null
+    },
+
+    "library": {
+        "database_path": "data/library.db"
+    }
+}

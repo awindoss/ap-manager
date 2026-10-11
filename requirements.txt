@@ -1,0 +1,9 @@
+# AP Library Manager — dependencies
+# See _mds/plan.md §5 / _mds/stage.md 前置准备
+
+# --- Runtime ---
+PySide6>=6.5.0
+
+# --- Testing ---
+# Only needed to run the test suite in tests/ (pytest.ini configures `pythonpath = .`).
+pytest>=7.0

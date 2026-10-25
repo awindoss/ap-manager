@@ -139,6 +139,10 @@ VALID_ICON_EXTENSIONS: Final[tuple[str, ...]] = (".png", ".ico", ".svg")
 DEFAULT_TEXT_COLOR: Final[str] = "#000000"
 DEFAULT_BOLD: Final[bool] = False
 
+# Tree rendering
+TREE_ICON_SIZE: Final[int] = 16
+MAX_NODE_NAME_LENGTH: Final[int] = 200
+
 
 # --------------------------------------------------------------------------
 # 7.PDF & File Handling
@@ -158,6 +162,14 @@ WARNING_ICON_MISSING_FILE: Final[str] = "⚠️"
 A threshold or pattern used to control certain specific behaviours."""
 
 DEFAULT_SORT_ORDER_INCREMENT: Final[int] = 1
+
+# Tree projection guards (Phase 2).
+# The graph is projected onto a tree; a corrupted dataset could otherwise make
+# the projection grow without bound (a cycle, or a diamond-shaped DAG whose
+# display instances multiply exponentially). Both limits abort the build
+# gracefully and are reported by the model instead of freezing the GUI.
+TREE_MAX_DEPTH: Final[int] = 64
+TREE_MAX_ITEMS: Final[int] = 200_000
 
 
 # --------------------------------------------------------------------------

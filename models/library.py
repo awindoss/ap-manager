@@ -3,7 +3,7 @@
 # Business logic layer: encapsulates database operations and handles core business rules (such as cyclic checks and node hierarchy navigation)
 # ==============================================================================
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Dict
 import sqlite3
 
 from models.database import Database
@@ -122,7 +122,11 @@ class LibraryService:
     # Queries on tree structures
     # --------------------------------------------------------------------------
     def get_node_children(self, parent_id: int) -> List[Node]:
-        """Retrieve a list of details for all child nodes of a specified node"""
+        """
+        Retrieve the child nodes of `parent_id`, ordered by the edge `sort_order`
+        (ties broken by edge id, i.e. insertion order). The ordering guarantee is
+        what the QTreeView projection relies on, so it must stay stable.
+        """
         child_ids = self.db.get_children(parent_id)
         children = []
         for cid in child_ids:
@@ -150,6 +154,25 @@ class LibraryService:
             if node:
                 roots.append(node)
         return roots
+
+    def get_all_nodes(self) -> List[Node]:
+        """
+        Retrieve every node stored in the library (ordered by node id).
+
+        Used by the tree view to detect nodes that cannot be reached from any
+        root (for example a component that only exists inside a cycle), and by
+        later phases for search and export.
+        """
+        return self.db.get_all_nodes()
+
+    def get_parent_count_map(self) -> Dict[int, int]:
+        """
+        Return ``{node_id: parent_count}`` for the whole library in one query.
+
+        The tree model caches this when building, so presentation code can show
+        the multi-parent badge without a database round-trip per row.
+        """
+        return self.db.get_parent_counts()
 
     def get_node_paths(self, node_id: int) -> List[List[int]]:
         """Retrieve all paths leading to this node from any root node (for UI expansion and positioning)"""

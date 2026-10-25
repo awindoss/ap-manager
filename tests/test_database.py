@@ -167,6 +167,24 @@ def test_get_root_nodes(db: Database):
     assert len(roots) == 1
 
 
+def test_get_parent_counts_aggregates_in_one_query(db: Database):
+    """Phase 3 badge data: one GROUP BY result for the whole graph."""
+    id_a = db.add_node(Node(name="A"))
+    id_b = db.add_node(Node(name="B"))
+    id_x = db.add_node(Node(name="Shared X"))
+    id_y = db.add_node(Node(name="Child Y"))
+    db.add_edge(id_a, id_x)
+    db.add_edge(id_b, id_x)
+    db.add_edge(id_x, id_y)
+
+    counts = db.get_parent_counts()
+
+    assert counts[id_x] == 2
+    assert counts[id_y] == 1
+    assert counts.get(id_a, 0) == 0
+    assert counts.get(id_b, 0) == 0
+
+
 def test_update_node_bogus_field(db: Database):
     """Test for updating a node with an invalid field: db.update_node(id, bogus="x") should not raise an exception, and valid fields should be updated as normal."""
     id_a = db.add_node(Node(name="Original Name"))

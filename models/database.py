@@ -5,11 +5,11 @@
 import sqlite3
 import json
 from pathlib import Path
-from typing import Optional, List, Any
+from typing import Optional, List, Dict, Any
 from contextlib import contextmanager
 from collections import deque
 
-from models.node import Node
+from models.node import Node, normalize_color, normalize_icon
 from models.edge import Edge
 from utils import constants
 from utils.logger import log_info, log_error, log_debug, log_warning
@@ -211,6 +211,14 @@ class Database:
                     values.append(json.dumps(val))
                 elif key == "style_bold":
                     values.append(1 if val else 0)
+                elif key == "style_color":
+                    # Keep the database canonical even when a caller bypasses the
+                    # controller/dialog validation.
+                    values.append(normalize_color(val))
+                elif key == "icon":
+                    values.append(normalize_icon(val))
+                elif key == "name":
+                    values.append("" if val is None else str(val).strip())
                 else:
                     values.append(val)
             else:
@@ -356,6 +364,27 @@ class Database:
         except sqlite3.Error as e:
             log_error(f"Error getting parents for {child_id}: {e}")
             return []
+
+    def get_parent_counts(self) -> Dict[int, int]:
+        """
+        Return ``{child_id: number_of_parents}`` for every node that has edges.
+
+        One aggregate query instead of one connection per node. The tree model
+        caches this map when it builds the projection, so the delegate can draw
+        the multi-parent badge without touching SQLite per painted row.
+        """
+        sql = (
+            f"SELECT {constants.COLUMN_EDGE_CHILD_ID}, COUNT(*) "
+            f"FROM {constants.TABLE_EDGES} "
+            f"GROUP BY {constants.COLUMN_EDGE_CHILD_ID}"
+        )
+        try:
+            with self.connection() as conn:
+                rows = conn.execute(sql).fetchall()
+                return {int(row[0]): int(row[1]) for row in rows}
+        except sqlite3.Error as e:
+            log_error(f"Error getting parent counts: {e}")
+            return {}
 
     def get_root_nodes(self) -> List[int]:
         sql = f"""

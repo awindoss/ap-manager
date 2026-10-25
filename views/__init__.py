@@ -1,1 +1,1 @@
-"""Qt views: main window, dialogs, delegates (see _mds/plan.md §5)."""
+"""Qt views: main window, tree model, dialogs, delegates (see _mds/plan.md §5)."""

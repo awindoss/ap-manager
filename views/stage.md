@@ -204,8 +204,6 @@ class TreeItem:
 
 ## 涉及文件
 
-text复制下载
-
 ```text
 views/
 ├── tree_model.py
@@ -222,7 +220,10 @@ models/
 
 utils/
 └── icon_utils.py (新增)
-```## 具体任务
+
+```
+
+## 具体任务
 
 ### 3.1`utils/icon_utils.py`
 
@@ -278,8 +279,6 @@ utils/
 目标：节点可挂载多个 PDF，打开 PDF（调用外部阅读器），处理缺失文件。
 
 ## 涉及文件
-
-text复制下载
 
 ```text
 services/

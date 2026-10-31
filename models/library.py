@@ -29,18 +29,20 @@ class LibraryService:
     # --------------------------------------------------------------------------
     def create_node(self, name: str, parent_id: Optional[int] = None, **kwargs) -> Optional[int]:
         """
-        Create a new node. If a parent_id is provided, the associated edge will be created automatically.
+        Create a new node. When `parent_id` is given, the node and the edge that
+        attaches it to that parent are written in a single transaction.
         """        
-        if parent_id is not None:
-            if self.db.get_node(parent_id) is None:
-                log_error(f"Parent node {parent_id} does not exist.")
-                raise ValueError(f"Parent node {parent_id} does not exist.")
+        if parent_id is not None and self.db.get_node(parent_id) is None:
+            log_error(f"Parent node {parent_id} does not exist.")
+            raise ValueError(f"Parent node {parent_id} does not exist.")
             
         new_node = Node(name=name, **kwargs)
-        node_id = self.db.add_node(new_node)
 
         if parent_id is not None:
-            self.db.add_edge(parent_id, node_id)
+            # Node + edge in one transaction: no orphan node if the edge fails.
+            return self.db.add_node_with_parent(new_node, parent_id)
+
+        node_id = self.db.add_node(new_node)
             
         return node_id
 

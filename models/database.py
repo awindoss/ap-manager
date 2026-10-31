@@ -147,7 +147,13 @@ class Database:
     # Node CRUD
     # --------------------------------------------------------------------------
 
-    def add_node(self, node: Node) -> int:
+    def _insert_node_with_conn(self, conn: sqlite3.Connection, node: Node) -> int:
+        """Internal helper: INSERT a node on an already-open connection.
+
+        Callers that must write several rows atomically (see
+        `add_node_with_parent`) reuse this so every statement shares one
+        transaction instead of committing per row.
+        """
         sql = f"""
             INSERT INTO {constants.TABLE_NODES} (
                 {constants.COLUMN_NODE_NAME}, 
@@ -158,21 +164,25 @@ class Database:
                 {constants.COLUMN_NODE_METADATA}
             ) VALUES (?, ?, ?, ?, ?, ?)
         """
+        cursor = conn.execute(sql, (
+            node.name,
+            json.dumps(node.pdf_paths),
+            node.icon,
+            1 if node.style_bold else 0,
+            node.style_color,
+            json.dumps(node.metadata)
+        ))
+        new_id = cursor.lastrowid
+        if new_id is None:
+            raise sqlite3.Error("Failed to retrieve new node ID")
+        return new_id
+
+    def add_node(self, node: Node) -> int:
         try:
             with self.connection() as conn:
-                cursor = conn.execute(sql, (
-                    node.name,
-                    json.dumps(node.pdf_paths),
-                    node.icon,
-                    1 if node.style_bold else 0,
-                    node.style_color,
-                    json.dumps(node.metadata)
-                ))
-                new_id = cursor.lastrowid
-                if new_id is None:
-                    raise sqlite3.Error("Failed to retrieve new node ID")
-                log_debug(f"Added node '{node.name}' with ID: {new_id}")
-                return new_id
+                new_id = self._insert_node_with_conn(conn, node)
+            log_debug(f"Added node '{node.name}' with ID: {new_id}")
+            return new_id
         except sqlite3.Error as e:
             log_error(f"Error adding node '{node.name}': {e}")
             raise
@@ -262,7 +272,14 @@ class Database:
     # Edge CRUD and Multi-Parent Graph Operations
     # --------------------------------------------------------------------------
 
-    def add_edge(self, parent_id: int, child_id: int, sort_order: int = 0) -> int:
+    def _insert_edge_with_conn(
+        self,
+        conn: sqlite3.Connection,
+        parent_id: int,
+        child_id: int,
+        sort_order: int = 0,
+    ) -> int:
+        """Internal helper: INSERT an edge on an already-open connection."""
         sql = f"""
             INSERT INTO {constants.TABLE_EDGES} (
                 {constants.COLUMN_EDGE_PARENT_ID}, 
@@ -270,14 +287,18 @@ class Database:
                 {constants.COLUMN_EDGE_SORT_ORDER}
             ) VALUES (?, ?, ?)
         """
+        cursor = conn.execute(sql, (parent_id, child_id, sort_order))
+        new_id = cursor.lastrowid
+        if new_id is None:
+            raise sqlite3.Error("Failed to retrieve new edge ID")
+        return new_id
+
+    def add_edge(self, parent_id: int, child_id: int, sort_order: int = 0) -> int:
         try:
             with self.connection() as conn:
-                cursor = conn.execute(sql, (parent_id, child_id, sort_order))
-                new_id = cursor.lastrowid
-                if new_id is None:
-                    raise sqlite3.Error("Failed to retrieve new edge ID")
-                log_debug(f"Edge added: {parent_id} -> {child_id} (order: {sort_order})")
-                return new_id
+                new_id = self._insert_edge_with_conn(conn, parent_id, child_id, sort_order)
+            log_debug(f"Edge added: {parent_id} -> {child_id} (order: {sort_order})")
+            return new_id
         except sqlite3.IntegrityError as e:
             name = getattr(e, "sqlite_errorname", "") or ""
             if name == "SQLITE_CONSTRAINT_UNIQUE":
@@ -290,6 +311,39 @@ class Database:
         except sqlite3.Error as e:
             log_error(f"Error adding edge {parent_id} -> {child_id}: {e}")
             raise
+
+    def add_node_with_parent(self, node: Node, parent_id: int, sort_order: int = 0) -> int:
+        """
+        Insert `node` and the edge attaching it to `parent_id` in one transaction.
+
+        This replaces the previous `add_node()` + `add_edge()` pair, which
+        committed twice: besides doubling the write cost it could leave an
+        orphan node behind whenever the edge insert failed (for example when
+        the parent disappeared between validation and write). Now either both
+        rows are committed, or neither is.
+        """
+        try:
+            with self.connection() as conn:
+                node_id = self._insert_node_with_conn(conn, node)
+                self._insert_edge_with_conn(conn, parent_id, node_id, sort_order)
+        except sqlite3.IntegrityError as e:
+            errname = getattr(e, "sqlite_errorname", "") or ""
+            if errname == "SQLITE_CONSTRAINT_FOREIGNKEY":
+                log_error(
+                    f"Cannot add node '{node.name}' under parent {parent_id}: "
+                    f"parent does not exist."
+                )
+            else:
+                log_error(
+                    f"IntegrityError adding node '{node.name}' under parent {parent_id}: {e}"
+                )
+            raise
+        except sqlite3.Error as e:
+            log_error(f"Error adding node '{node.name}' under parent {parent_id}: {e}")
+            raise
+
+        log_debug(f"Added node '{node.name}' (ID: {node_id}) under parent {parent_id}")
+        return node_id
 
     def delete_edge(self, parent_id: int, child_id: int) -> None:
         sql = f"""

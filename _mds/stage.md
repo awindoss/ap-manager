@@ -135,8 +135,6 @@ class Edge:
 
 ## 涉及文件
 
-text复制下载
-
 ```text
 views/
 ├── main_window.py
@@ -147,7 +145,8 @@ controllers/
 
 models/
 └── library.py  (可能微调)
-```## 具体任务
+```
+## 具体任务
 
 ### 2.1`models/library.py`补充方法
 
@@ -166,8 +165,8 @@ class TreeItem:
     children: List['TreeItem']
     display_path: Tuple[int, ...]   # 用于路径去重
 ```
-- 实现 TreeModel 继承 QAbstractItemModel：
 
+- 实现 TreeModel 继承 QAbstractItemModel：
   - __init__(library_service)，存储根 items 列表。
   - load_roots() → 调用 lib.get_all_roots()，为每个根创建 TreeItem，递归构建子树。
   - build_subtree(parent_item, current_path_set) 递归：
@@ -205,8 +204,6 @@ class TreeItem:
 
 ## 涉及文件
 
-text复制下载
-
 ```text
 views/
 ├── tree_model.py
@@ -223,7 +220,10 @@ models/
 
 utils/
 └── icon_utils.py (新增)
-```## 具体任务
+
+```
+
+## 具体任务
 
 ### 3.1`utils/icon_utils.py`
 
@@ -280,8 +280,6 @@ utils/
 
 ## 涉及文件
 
-text复制下载
-
 ```text
 services/
 ├── pdf_launcher.py
@@ -300,7 +298,9 @@ models/
 
 controllers/
 └── app_controller.py (增加 PDF 入口)
-```## 具体任务
+```
+
+## 具体任务
 
 ### 4.1`services/path_manager.py`
 
@@ -357,8 +357,6 @@ controllers/
 
 ## 涉及文件
 
-text复制下载
-
 ```text
 views/
 ├── dialogs/
@@ -369,7 +367,9 @@ views/
 
 controllers/
 └── app_controller.py
-```## 具体任务
+```
+
+## 具体任务
 
 ### 5.1`views/dialogs/choose_parent_dialog.py`
 
@@ -415,8 +415,6 @@ controllers/
 
 ## 涉及文件
 
-text复制下载
-
 ```text
 services/
 ├── exporter.py
@@ -433,7 +431,9 @@ models/
 
 utils/
 └── json_utils.py
-```## 具体任务
+```
+
+## 具体任务
 
 ### 6.1`services/exporter.py`
 
@@ -479,8 +479,6 @@ utils/
 
 ## 涉及文件
 
-text复制下载
-
 ```text
 views/
 ├── dialogs/
@@ -493,7 +491,9 @@ controllers/
 
 utils/
 └── settings_manager.py (新增)
-```## 具体任务
+```
+
+## 具体任务
 
 ### 7.1`utils/settings_manager.py`
 
@@ -530,8 +530,6 @@ utils/
 
 ## 涉及文件
 
-text复制下载
-
 ```text
 services/
 └── annotation_handler.py
@@ -544,7 +542,9 @@ views/
 ├── dialogs/
 │   └── annotation_dialog.py
 └── main_window.py (菜单入口)
-```## 具体任务
+```
+
+## 具体任务
 
 ### 8.1`services/annotation_handler.py`
 
@@ -567,15 +567,15 @@ views/
 
 ## 附录：各阶段依赖关系
 
-text复制下载
-
 ```text
 Phase 1 (数据层) → Phase 2 (树视图) → Phase 3 (样式) → Phase 4 (PDF)
                                                   ↘ Phase 5 (多父级交互)
 Phase 6 (导入导出) 依赖于 Phase 1~5 全部
 Phase 7 (搜索优化) 依赖于 Phase 2~5
 Phase 8 (注释) 可独立于 Phase 6,7，但建议在 Phase 4 之后
-```## 整体验收清单（最终）
+```
+
+## 整体验收清单（最终）
 
 - □所有 Phase 功能完整。
 - □多父级展示正确，循环被阻止。

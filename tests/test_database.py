@@ -2,6 +2,8 @@
 # tests/test_database.py
 # Unit testing of the core data layer: verifying multiple parent relationships, cascading deletes, cycle detection and overall consistency
 # ==============================================================================
+import sqlite3
+
 import pytest
 from pathlib import Path
 from utils import constants
@@ -233,3 +235,42 @@ def test_multi_level_shared_subtree(db: Database):
 
     positions_y = db.get_all_positions(y)
     assert sorted(positions_y) == sorted([[a, x, y], [b, x, y]])
+
+
+def test_add_node_with_parent_writes_both_rows(db: Database):
+    """A child node and the edge attaching it are created by one call."""
+    parent = db.add_node(Node(name="Parent"))
+
+    child = db.add_node_with_parent(Node(name="Child"), parent)
+
+    assert db.get_node(child).name == "Child"
+    assert db.get_children(parent) == [child]
+    assert len(db.get_all_nodes()) == 2
+    assert len(db.get_all_edges()) == 1
+
+
+def test_add_node_with_parent_rolls_back_when_parent_missing(db: Database):
+    """A failed edge insert must not leave an orphan node behind."""
+    with pytest.raises(sqlite3.IntegrityError):
+        db.add_node_with_parent(Node(name="Orphan"), 9999)
+
+    assert db.get_all_nodes() == []
+    assert db.get_all_edges() == []
+
+
+def test_library_create_node_under_parent_is_atomic(db: Database):
+    """LibraryService.create_node takes the single-transaction path."""
+    from models.library import LibraryService
+
+    service = LibraryService(db_path=db.db_path)
+    root = service.create_node("Root")
+    child = service.create_node("Child", parent_id=root)
+
+    assert service.db.get_children(root) == [child]
+    assert len(service.db.get_all_nodes()) == 2
+    assert len(service.db.get_all_edges()) == 1
+
+    with pytest.raises(ValueError):
+        service.create_node("Nope", parent_id=9999)
+    assert len(service.db.get_all_nodes()) == 2
+    assert len(service.db.get_all_edges()) == 1

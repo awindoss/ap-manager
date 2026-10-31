@@ -220,11 +220,14 @@ Phase 4.7（依赖 `services/path_manager.py`），两处文档冲突。
 - **沙箱限制（与项目无关）**：pytest 的 `tmp_path` 用 `mode=0o700` 建目录，在本沙箱下
   不可列举，整批用例会在 fixture 阶段报 `PermissionError`；本次评估用临时 harness
   绕过后 29 项全绿。正常机器上不存在该问题。
-- **磁盘写入观察**：本工作区单次 SQLite commit 实测约 0.59 s（50 次独立事务 29.3 s），
-  而一次建节点会写 2~4 个事务。若真实机器也这样，新建节点会有明显卡顿；
-  建议在 SSD 上复核，或把 `create_node` 的两个写操作（node + edge）合并为一个事务。
-- **文档冗余**：`views/plan.md` 与 `_mds/plan.md` 内容完全相同，`views/stage.md` 是
-  重排版本；建议留一份，避免后续按错文档施工。
+- **磁盘写入观察**（部分已处理 2026-10-31）：本工作区单次 SQLite commit 实测约 0.59 s
+  （50 次独立事务 29.3 s），而一次建节点会写 2~4 个事务。若真实机器也这样，新建节点会有
+  明显卡顿。现已把 `create_node` 的 node + edge 合并为单个事务
+  （`Database.add_node_with_parent`），事务数减半；但复核实测约 0.038 s/节点（连续 10 次），
+  未能复现 0.59 s/commit 的慢速，该性能担忧在当前机器上不成立，原子性收益仍然保留。
+- **文档冗余**（已于 2026-10-31 处理）：`views/plan.md` 与 `_mds/plan.md` 内容完全相同，
+  `views/stage.md` 是重排版本；已把重排版合并回 `_mds/stage.md` 并删除 `views/` 下的两份
+  副本，现在 `_mds/` 是唯一的文档位置。
 
 ---
 

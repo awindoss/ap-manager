@@ -12,6 +12,15 @@ from models.node import Node
 from models.edge import Edge
 from utils.logger import log_info, log_error, log_warning
 
+
+class GraphCycleError(ValueError):
+    """Raised when an operation would introduce a cycle into the graph.
+
+    Subclasses :class:`ValueError` so existing callers that only handle
+    ``ValueError`` keep working, while the UI can give a specific message.
+    """
+
+
 class LibraryService:
     """
     The Library class provides core graph management functionality.
@@ -73,11 +82,12 @@ class LibraryService:
 
         if self.db.would_create_cycle(new_parent_id, child_id):
             log_error(f"Cycle detected! Cannot move child {child_id} under new parent {new_parent_id}.")
-            raise ValueError("Operation rejected: moving this node would create a cycle in the graph.")
+            raise GraphCycleError(
+                "Operation rejected: moving this node would create a cycle in the graph."
+            )
 
         if sort_order is None:
-            siblings = self.db.get_children(new_parent_id)
-            sort_order = len(siblings)
+            sort_order = self.db.get_max_sort_order(new_parent_id) + 1
 
         try:
             self.db.move_edge(old_parent_id, child_id, new_parent_id, sort_order)
@@ -107,19 +117,97 @@ class LibraryService:
 
         if self.db.would_create_cycle(parent_id, child_id):
             log_error(f"Cycle detected! Cannot link parent {parent_id} to child {child_id}.")
-            raise ValueError("Operation rejected: linking these nodes would create a cycle in the graph.")
+            raise GraphCycleError(
+                "Operation rejected: linking these nodes would create a cycle in the graph."
+            )
+
+        if self.db.get_edge(parent_id, child_id) is not None:
+            raise ValueError("该位置已经包含这个节点。")
 
         if sort_order is None:
-            siblings = self.db.get_children(parent_id)
-            sort_order = len(siblings)
+            sort_order = self.db.get_max_sort_order(parent_id) + 1
 
         edge_id = self.db.add_edge(parent_id, child_id, sort_order)
         log_info(f"Successfully linked node {parent_id} -> {child_id} (Edge ID: {edge_id})")
         return edge_id
 
-    def detach_nodes(self, parent_id: int, child_id: int) -> None:
-        """Remove the link between two nodes"""
+    def detach_nodes(self, parent_id: int, child_id: int) -> bool:
+        """
+        Remove one edge (one position) between two nodes.
+
+        The node itself and every other edge pointing at it are left untouched
+        (plan.md §15.1). Returns True when an edge was actually removed.
+        """
+        if self.db.get_edge(parent_id, child_id) is None:
+            log_warning(
+                f"Detach ignored: edge {parent_id} -> {child_id} does not exist."
+            )
+            return False
         self.db.delete_edge(parent_id, child_id)
+        log_info(f"Detached node {child_id} from parent {parent_id}.")
+        return True
+
+    def would_create_cycle(self, parent_id: int, child_id: int) -> bool:
+        """Business-layer wrapper around the database cycle check."""
+        return self.db.would_create_cycle(parent_id, child_id)
+
+    def get_descendant_ids(self, node_id: int) -> List[int]:
+        """Every node below ``node_id`` (transitively, excluding itself)."""
+        return self.db.get_descendant_ids(node_id)
+
+    # --------------------------------------------------------------------------
+    # Edge ordering (Phase 5 drag sorting)
+    # --------------------------------------------------------------------------
+    def reorder_children(self, parent_id: int, ordered_child_ids: List[int]) -> bool:
+        """
+        Replace the sibling order below ``parent_id``.
+
+        The caller must pass every current child exactly once; this keeps the
+        operation non-destructive (no edge is created or removed by sorting).
+        Returns False when the requested order is already in effect.
+        """
+        current = self.db.get_children(parent_id)
+        requested = [int(child_id) for child_id in ordered_child_ids]
+        if set(current) != set(requested) or len(requested) != len(current):
+            raise ValueError("子节点列表已变化，请刷新后重试。")
+        if current == requested:
+            return False
+        self.db.update_edge_sort_orders(parent_id, requested)
+        log_info(f"Reordered {len(requested)} child(ren) below parent {parent_id}.")
+        return True
+
+    def reorder_relative(
+        self,
+        parent_id: int,
+        child_id: int,
+        target_child_id: int,
+        before: bool = True,
+    ) -> bool:
+        """
+        Move one sibling before/after another sibling under the same parent.
+
+        Used by drag-and-drop sorting; only the ``sort_order`` values change.
+        """
+        if child_id == target_child_id:
+            return False
+        current = self.db.get_children(parent_id)
+        if child_id not in current or target_child_id not in current:
+            raise ValueError("要排序的节点不在同一个父级下，请刷新后重试。")
+
+        remaining = [cid for cid in current if cid != child_id]
+        index = remaining.index(target_child_id)
+        if not before:
+            index += 1
+        remaining.insert(index, child_id)
+        if remaining == current:
+            return False
+        self.db.update_edge_sort_orders(parent_id, remaining)
+        log_info(
+            f"Reordered node {child_id} "
+            f"{'before' if before else 'after'} node {target_child_id} "
+            f"below parent {parent_id}."
+        )
+        return True
 
     # --------------------------------------------------------------------------
     # Queries on tree structures
@@ -147,6 +235,10 @@ class LibraryService:
             if node:
                 parents.append(node)
         return parents
+
+    def get_parent_ids(self, child_id: int) -> List[int]:
+        """Parent node ids of ``child_id`` (ordered by parent id)."""
+        return self.db.get_parents(child_id)
 
     def get_all_roots(self) -> List[Node]:
         """Retrieve all root nodes (top-level nodes with no parent)"""

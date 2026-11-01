@@ -312,7 +312,7 @@ class Database:
             log_error(f"Error adding edge {parent_id} -> {child_id}: {e}")
             raise
 
-    def add_node_with_parent(self, node: Node, parent_id: int, sort_order: int = 0) -> int:
+    def add_node_with_parent(self, node: Node, parent_id: int, sort_order: Optional[int] = None) -> int:
         """
         Insert `node` and the edge attaching it to `parent_id` in one transaction.
 
@@ -321,10 +321,16 @@ class Database:
         orphan node behind whenever the edge insert failed (for example when
         the parent disappeared between validation and write). Now either both
         rows are committed, or neither is.
+
+        When ``sort_order`` is omitted the node is appended after the existing
+        children (max + 1), so creating several children in a row keeps the
+        insertion order even after siblings have been removed.
         """
         try:
             with self.connection() as conn:
                 node_id = self._insert_node_with_conn(conn, node)
+                if sort_order is None:
+                    sort_order = self._get_max_sort_order_with_conn(conn, parent_id) + 1
                 self._insert_edge_with_conn(conn, parent_id, node_id, sort_order)
         except sqlite3.IntegrityError as e:
             errname = getattr(e, "sqlite_errorname", "") or ""
@@ -344,6 +350,92 @@ class Database:
 
         log_debug(f"Added node '{node.name}' (ID: {node_id}) under parent {parent_id}")
         return node_id
+
+    def get_edge(self, parent_id: int, child_id: int) -> Optional[Edge]:
+        """Return the edge ``parent_id -> child_id``, or None when absent."""
+        sql = f"""
+            SELECT * FROM {constants.TABLE_EDGES}
+            WHERE {constants.COLUMN_EDGE_PARENT_ID} = ?
+            AND {constants.COLUMN_EDGE_CHILD_ID} = ?
+            LIMIT 1
+        """
+        try:
+            with self.connection() as conn:
+                row = conn.execute(sql, (parent_id, child_id)).fetchone()
+                return self._row_to_edge(row) if row else None
+        except sqlite3.Error as e:
+            log_error(f"Error retrieving edge {parent_id} -> {child_id}: {e}")
+            return None
+
+    def _get_max_sort_order_with_conn(self, conn: sqlite3.Connection, parent_id: int) -> int:
+        """Internal helper: highest sort_order below ``parent_id`` (-1 when empty)."""
+        sql = (
+            f"SELECT MAX({constants.COLUMN_EDGE_SORT_ORDER}) "
+            f"FROM {constants.TABLE_EDGES} "
+            f"WHERE {constants.COLUMN_EDGE_PARENT_ID} = ?"
+        )
+        row = conn.execute(sql, (parent_id,)).fetchone()
+        return int(row[0]) if row and row[0] is not None else -1
+
+    def get_max_sort_order(self, parent_id: int) -> int:
+        """
+        Highest ``sort_order`` currently used below ``parent_id``.
+
+        New edges are appended with ``max + 1`` instead of ``len(children)``:
+        after a detach, ``len()`` could collide with an existing order and make
+        the display order depend on the edge id tie-breaker.
+        """
+        try:
+            with self.connection() as conn:
+                return self._get_max_sort_order_with_conn(conn, parent_id)
+        except sqlite3.Error as e:
+            log_error(f"Error getting max sort order for parent {parent_id}: {e}")
+            return -1
+
+    def get_edge_sort_order(self, parent_id: int, child_id: int) -> Optional[int]:
+        """Return the sort order of one edge, or None when it does not exist."""
+        edge = self.get_edge(parent_id, child_id)
+        return edge.sort_order if edge is not None else None
+
+    def update_edge_sort_orders(
+        self,
+        parent_id: int,
+        ordered_child_ids: List[int],
+    ) -> None:
+        """
+        Rewrite the order of every child below ``parent_id`` in one transaction.
+
+        ``ordered_child_ids`` must contain exactly the current children of
+        ``parent_id`` (each once). The validation happens inside the same
+        transaction as the updates, so a concurrent/inconsistent change aborts
+        the whole reorder instead of leaving a half-renumbered sibling list.
+        """
+        ordered = [int(child_id) for child_id in ordered_child_ids]
+        if len(ordered) != len(set(ordered)):
+            raise ValueError("排序列表中存在重复的子节点。")
+
+        try:
+            with self.connection() as conn:
+                current = self._get_children_with_conn(conn, parent_id)
+                if set(current) != set(ordered):
+                    raise ValueError("子节点列表已变化，请刷新后重试。")
+
+                for index, child_id in enumerate(ordered):
+                    cursor = conn.execute(
+                        f"UPDATE {constants.TABLE_EDGES} "
+                        f"SET {constants.COLUMN_EDGE_SORT_ORDER} = ? "
+                        f"WHERE {constants.COLUMN_EDGE_PARENT_ID} = ? "
+                        f"AND {constants.COLUMN_EDGE_CHILD_ID} = ?",
+                        (index, parent_id, child_id),
+                    )
+                    if cursor.rowcount != 1:
+                        raise sqlite3.Error(
+                            f"Edge {parent_id} -> {child_id} disappeared during reorder."
+                        )
+            log_debug(f"Reordered {len(ordered)} child(ren) below parent {parent_id}.")
+        except sqlite3.Error as e:
+            log_error(f"Error reordering children of {parent_id}: {e}")
+            raise
 
     def delete_edge(self, parent_id: int, child_id: int) -> None:
         sql = f"""
@@ -459,6 +551,31 @@ class Database:
     # --------------------------------------------------------------------------
     # Graph Algorithms (Cycle Detection and Localisation)
     # --------------------------------------------------------------------------
+
+    def get_descendant_ids(self, node_id: int) -> List[int]:
+        """
+        Every node reachable by following edges forward from ``node_id``.
+
+        The starting node itself is not included. The result is ordered
+        breadth-first, which keeps the order stable for dialogs/tests. The
+        visited set also protects against a corrupted cyclic graph.
+        """
+        descendants: List[int] = []
+        visited = {node_id}
+        try:
+            with self.connection() as conn:
+                queue = deque([node_id])
+                while queue:
+                    current = queue.popleft()
+                    for child_id in self._get_children_with_conn(conn, current):
+                        if child_id in visited:
+                            continue
+                        visited.add(child_id)
+                        descendants.append(child_id)
+                        queue.append(child_id)
+        except sqlite3.Error as e:
+            log_error(f"Error collecting descendants of node {node_id}: {e}")
+        return descendants
 
     def would_create_cycle(self, parent_id: int, child_id: int) -> bool:
         if parent_id == child_id:

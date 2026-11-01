@@ -10,7 +10,7 @@ import sqlite3
 from typing import List, Optional, Sequence
 
 from PySide6.QtCore import QModelIndex, QPoint, Qt
-from PySide6.QtGui import QAction, QCloseEvent, QKeySequence
+from PySide6.QtGui import QAction, QCloseEvent, QCursor, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
@@ -18,10 +18,9 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
-    QTreeView,
 )
 
-from controllers.app_controller import AppController
+from controllers.app_controller import AppController, AttachResult, MoveOutcome
 from services.pdf_launcher import LaunchReport, PdfLaunchError
 from utils.constants import (
     APP_NAME,
@@ -32,11 +31,14 @@ from utils.constants import (
 from utils.logger import log_error, log_info
 from views.delegates.tree_delegate import TreeDelegate
 from views.dialogs.add_node_dialog import AddNodeDialog
+from views.dialogs.choose_parent_dialog import ChooseParentDialog
 from views.dialogs.missing_files_dialog import MissingFilesDialog
+from views.dialogs.node_positions_dialog import NodePositionsDialog
 from views.dialogs.node_properties_dialog import NodePropertiesDialog
 from views.dialogs.pdf_management_dialog import PdfManagementDialog
 from views.dialogs.pdf_selector_dialog import PdfSelectorDialog
 from views.dialogs.settings_dialog import SettingsDialog
+from views.library_tree_view import LibraryTreeView
 from views.tree_model import DisplayPath, TreeItem, TreeModel
 
 
@@ -72,13 +74,14 @@ class MainWindow(QMainWindow):
         # Window geometry is persisted from Phase 7 on (config.json -> ui.*).
         self.resize(DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT)
 
-        self.tree_view = QTreeView(self)
-        self.tree_view.setModel(self.model)
+        self.tree_view = LibraryTreeView(self.model, self.controller, self)
         self.tree_view.setItemDelegate(self.tree_delegate)
         self.tree_view.setHeaderHidden(True)
         self.tree_view.setUniformRowHeights(True)
         self.tree_view.setAlternatingRowColors(True)
-        self.tree_view.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        # Extended selection enables dragging several nodes at once (plan.md
+        # §31.2); all single-node actions keep using the current index.
+        self.tree_view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.tree_view.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         # Double-click is handled explicitly below: an expandable node toggles,
         # a childless node with PDFs opens them (one directly, several through
@@ -87,6 +90,11 @@ class MainWindow(QMainWindow):
         self.tree_view.doubleClicked.connect(self._on_double_clicked)
         self.tree_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree_view.customContextMenuRequested.connect(self._show_context_menu)
+        # Phase 5 drag and drop: drops produce relation/sorting signals, the
+        # database is only written by the handlers below.
+        self.tree_view.associateDropped.connect(self._on_nodes_dropped)
+        self.tree_view.reorderDropped.connect(self._on_reorder_dropped)
+        self.tree_view.dropRejected.connect(self._on_drop_rejected)
 
         selection_model = self.tree_view.selectionModel()
         if selection_model is not None:
@@ -134,6 +142,40 @@ class MainWindow(QMainWindow):
 
         edit_menu.addSeparator()
 
+        self._attach_action = QAction("关联到其他位置(&L)…", self)
+        self._attach_action.setShortcut(QKeySequence("Ctrl+Shift+A"))
+        self._attach_action.setStatusTip("把节点额外关联到其他父级位置")
+        self._attach_action.triggered.connect(self._attach_for_selection)
+        edit_menu.addAction(self._attach_action)
+
+        self._move_action = QAction("移动到其他位置(&M)…", self)
+        self._move_action.setShortcut(QKeySequence("Ctrl+Shift+M"))
+        self._move_action.setStatusTip("从当前父级移除该位置，并放到另一个父级下")
+        self._move_action.triggered.connect(self._move_for_selection)
+        edit_menu.addAction(self._move_action)
+
+        self._positions_action = QAction("查看所有位置(&P)…", self)
+        self._positions_action.setShortcut(QKeySequence("Ctrl+Shift+L"))
+        self._positions_action.setStatusTip("列出节点的全部位置并跳转到选中位置")
+        self._positions_action.triggered.connect(self._show_positions_for_selection)
+        edit_menu.addAction(self._positions_action)
+
+        edit_menu.addSeparator()
+
+        self._detach_action = QAction("从当前父级移除(&R)", self)
+        self._detach_action.setShortcut(QKeySequence("Ctrl+Shift+D"))
+        self._detach_action.setStatusTip("只删除当前位置，不删除节点本身")
+        self._detach_action.triggered.connect(self._detach_for_selection)
+        edit_menu.addAction(self._detach_action)
+
+        self._delete_action = QAction("彻底删除节点(&X)…", self)
+        self._delete_action.setShortcut(QKeySequence("Ctrl+Delete"))
+        self._delete_action.setStatusTip("删除节点及其全部位置（磁盘 PDF 不受影响）")
+        self._delete_action.triggered.connect(self._delete_for_selection)
+        edit_menu.addAction(self._delete_action)
+
+        edit_menu.addSeparator()
+
         self._manage_pdf_action = QAction("管理 PDF(&D)…", self)
         self._manage_pdf_action.setShortcut(QKeySequence("Ctrl+Shift+P"))
         self._manage_pdf_action.setStatusTip("添加、移除、重新定位或打开该节点的 PDF")
@@ -155,6 +197,11 @@ class MainWindow(QMainWindow):
             self._new_child_action,
             self._edit_action,
             self._style_action,
+            self._attach_action,
+            self._move_action,
+            self._positions_action,
+            self._detach_action,
+            self._delete_action,
             self._manage_pdf_action,
         ]
 
@@ -319,6 +366,12 @@ class MainWindow(QMainWindow):
         for action in self._selection_actions:
             action.setEnabled(has_selection)
 
+        has_parent = item is not None and item.parent_item is not None
+        # A root has no position to remove/move from; associating it with a new
+        # parent is still meaningful.
+        self._detach_action.setEnabled(has_selection and has_parent)
+        self._move_action.setEnabled(has_selection and has_parent)
+
         pdf_count = (
             len(item.node.pdf_paths)
             if item is not None and item.node is not None
@@ -332,20 +385,51 @@ class MainWindow(QMainWindow):
         instances = self.model.find_items_by_node_id(node_id)
         if not instances:
             return
+        self._reveal_display_path(instances[0].display_path)
 
-        path = instances[0].display_path
+    def _reveal_display_path(self, display_path: Sequence[int]) -> bool:
+        """
+        Expand every ancestor and select one exact display instance.
+
+        Sorting and moving keep the node-id path unchanged, so restoring by
+        path is stable; if the instance disappeared (for example the selected
+        position was detached) the method reports it instead of selecting an
+        arbitrary duplicate.
+        """
+        path = tuple(int(part) for part in display_path)
+        if not path:
+            return False
+
         for depth in range(1, len(path) + 1):
             ancestor = self.model.find_index_by_display_path(path[:depth])
-            if ancestor.isValid():
-                self.tree_view.expand(ancestor)
+            if not ancestor.isValid():
+                self.statusBar().showMessage(
+                    "该位置已不存在，请刷新后重试。", 4000
+                )
+                return False
+            self.tree_view.expand(ancestor)
 
         index = self.model.find_index_by_display_path(path)
-        if index.isValid():
-            self.tree_view.setCurrentIndex(index)
-            self.tree_view.scrollTo(
-                index, QAbstractItemView.ScrollHint.PositionAtCenter
-            )
-            self.tree_view.setFocus()
+        if not index.isValid():
+            self.statusBar().showMessage("该位置已不存在，请刷新后重试。", 4000)
+            return False
+
+        self.tree_view.setCurrentIndex(index)
+        self.tree_view.scrollTo(
+            index, QAbstractItemView.ScrollHint.PositionAtCenter
+        )
+        self.tree_view.setFocus()
+        return True
+
+    def _reveal_node_under_parent(self, node_id: int, parent_id: int) -> bool:
+        """Reveal the instance of ``node_id`` whose direct parent is ``parent_id``."""
+        for instance in self.model.find_items_by_node_id(node_id):
+            path = instance.display_path
+            if len(path) > 1 and path[-2] == parent_id:
+                if self._reveal_display_path(path):
+                    return True
+        self._reveal_node(node_id)
+        return True
 
     # --------------------------------------------------------------------------
     # Node creation / editing
@@ -589,6 +673,447 @@ class MainWindow(QMainWindow):
             )
 
     # --------------------------------------------------------------------------
+    # Multi-parent relations (Phase 5)
+    # --------------------------------------------------------------------------
+    def _current_item(self) -> Optional[TreeItem]:
+        return self.model.item_from_index(self.tree_view.currentIndex())
+
+    def _node_name(self, node_id: int) -> str:
+        node = self.controller.get_node(node_id)
+        return node.name if node is not None else f"#{node_id}"
+
+    # --- view all positions ---------------------------------------------------
+    def _show_positions_for_selection(self) -> None:
+        item = self._current_item()
+        if item is None:
+            self.statusBar().showMessage("请先选择一个节点。", 3000)
+            return
+        self._show_positions(item.node_id, item.display_path)
+
+    def _show_positions(
+        self,
+        node_id: int,
+        current_path: Optional[Sequence[int]] = None,
+    ) -> None:
+        node = self.controller.get_node(node_id)
+        if node is None:
+            QMessageBox.warning(self, "无法查看位置", "节点不存在，请刷新后重试。")
+            self.refresh()
+            return
+
+        try:
+            positions = self.controller.get_node_positions(node_id)
+        except ValueError as error:
+            QMessageBox.warning(self, "无法查看位置", str(error))
+            return
+
+        dialog = NodePositionsDialog(
+            node.name,
+            positions,
+            self,
+            current_path=tuple(current_path) if current_path else None,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        selected = dialog.selected_path()
+        if selected:
+            self._reveal_display_path(selected)
+            self.statusBar().showMessage(
+                f"已定位「{node.name}」的一个位置。", 4000
+            )
+
+    # --- attach to other locations -------------------------------------------
+    def _attach_for_selection(self) -> None:
+        item = self._current_item()
+        if item is None:
+            self.statusBar().showMessage("请先选择一个节点。", 3000)
+            return
+        self._attach_node(item.node_id)
+
+    def _attach_node(self, node_id: int) -> None:
+        node = self.controller.get_node(node_id)
+        if node is None:
+            QMessageBox.warning(self, "无法关联", "节点不存在，请刷新后重试。")
+            self.refresh()
+            return
+
+        excluded = set(self.controller.get_parent_ids(node_id))
+        dialog = ChooseParentDialog(
+            self.controller,
+            node_id,
+            self,
+            excluded_parent_ids=excluded,
+            mode="attach",
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        targets = dialog.selected_parent_ids()
+        if targets:
+            self._attach_node_to_parents(node_id, targets)
+
+    def _attach_node_to_parents(self, node_id: int, parent_ids: Sequence[int]) -> None:
+        try:
+            result = self.controller.attach_node_to_parents(node_id, list(parent_ids))
+        except (ValueError, sqlite3.Error) as error:
+            log_error(f"Could not attach node {node_id}: {error}")
+            QMessageBox.warning(self, "无法关联", str(error))
+            return
+        self._apply_attach_result(result)
+
+    def _attach_nodes_to_parent(self, node_ids: Sequence[int], parent_id: int) -> None:
+        try:
+            result = self.controller.attach_nodes_to_parent(list(node_ids), parent_id)
+        except (ValueError, sqlite3.Error) as error:
+            log_error(f"Could not attach nodes to parent {parent_id}: {error}")
+            QMessageBox.warning(self, "无法关联", str(error))
+            return
+        self._apply_attach_result(result)
+
+    def _apply_attach_result(self, result: AttachResult) -> None:
+        """Refresh once, reveal the first new position, report all rejections."""
+        if result.has_changes:
+            self.refresh()
+
+        if result.attached:
+            parent_id, child_id = result.attached[0]
+            if result.has_changes:
+                self._reveal_node_under_parent(child_id, parent_id)
+            message = f"已关联 {len(result.attached)} 个新位置。"
+            if result.already:
+                message += f" 跳过 {len(result.already)} 个已存在的位置。"
+            self.statusBar().showMessage(message, 5000)
+        elif result.already:
+            self.statusBar().showMessage(
+                f"所选位置已经包含该节点（{len(result.already)} 个），无需重复关联。",
+                5000,
+            )
+        elif not result.errors:
+            self.statusBar().showMessage("没有可关联的新位置。", 4000)
+
+        if result.errors:
+            lines = []
+            for (parent_id, child_id), message in result.errors[:5]:
+                lines.append(
+                    f"• {self._node_name(child_id)} → {self._node_name(parent_id)}\n"
+                    f"  {message}"
+                )
+            if len(result.errors) > 5:
+                lines.append("…")
+            QMessageBox.warning(
+                self,
+                "部分位置未能关联",
+                f"{len(result.errors)} 个位置未能关联：\n\n" + "\n\n".join(lines),
+            )
+
+    # --- move to another location --------------------------------------------
+    def _move_for_selection(self) -> None:
+        item = self._current_item()
+        if item is None:
+            self.statusBar().showMessage("请先选择一个节点。", 3000)
+            return
+        if item.parent_item is None:
+            self.statusBar().showMessage(
+                "根节点没有原位置；请使用「关联到其他位置」。", 4000
+            )
+            return
+        self._move_node_from_path(item.display_path)
+
+    def _move_node_from_path(
+        self,
+        source_path: Sequence[int],
+        target_parent_id: Optional[int] = None,
+    ) -> None:
+        path = tuple(int(part) for part in source_path)
+        if not path:
+            return
+        node_id = path[-1]
+        old_parent_id = path[-2] if len(path) > 1 else None
+        node = self.controller.get_node(node_id)
+        if node is None:
+            QMessageBox.warning(self, "无法移动", "节点不存在，请刷新后重试。")
+            self.refresh()
+            return
+
+        if old_parent_id is None and target_parent_id is None:
+            self._attach_node(node_id)
+            return
+
+        if target_parent_id is None:
+            excluded = {old_parent_id} if old_parent_id is not None else set()
+            dialog = ChooseParentDialog(
+                self.controller,
+                node_id,
+                self,
+                excluded_parent_ids=excluded,
+                mode="move",
+            )
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            targets = dialog.selected_parent_ids()
+            if not targets:
+                return
+            target_parent_id = targets[0]
+
+        target_parent_id = int(target_parent_id)
+        old_name = self._node_name(old_parent_id) if old_parent_id is not None else ""
+        new_name = self._node_name(target_parent_id)
+
+        try:
+            outcome: MoveOutcome = self.controller.move_node(
+                old_parent_id, node_id, target_parent_id
+            )
+        except (ValueError, sqlite3.Error) as error:
+            log_error(f"Could not move node {node_id}: {error}")
+            QMessageBox.warning(self, "无法移动", str(error))
+            return
+
+        self.refresh()
+        self._reveal_node_under_parent(node_id, target_parent_id)
+
+        if outcome.kind == "moved":
+            message = f"已将「{node.name}」从「{old_name}」移动到「{new_name}」。"
+        elif outcome.kind == "merged":
+            message = (
+                f"「{new_name}」已经包含「{node.name}」，已移除原位置「{old_name}」。"
+            )
+        elif outcome.kind == "attached":
+            message = f"已将根节点「{node.name}」关联到「{new_name}」。"
+        elif outcome.kind == "already":
+            message = f"「{new_name}」已经包含「{node.name}」。"
+        else:
+            message = "位置没有变化。"
+        self.statusBar().showMessage(message, 5000)
+
+    # --- remove from current parent ------------------------------------------
+    def _detach_for_selection(self) -> None:
+        item = self._current_item()
+        if item is None:
+            self.statusBar().showMessage("请先选择一个节点。", 3000)
+            return
+        if item.parent_item is None:
+            self.statusBar().showMessage("根节点没有父级位置，无法移除。", 4000)
+            return
+        self._detach_item(item)
+
+    def _confirm_detach(self, node_id: int, parent_id: int) -> bool:
+        node_name = self._node_name(node_id)
+        parent_name = self._node_name(parent_id)
+        other_positions = max(
+            0, len(self.controller.get_parent_ids(node_id)) - 1
+        )
+        text = (
+            f"确定从「{parent_name}」中移除「{node_name}」吗？\n\n"
+            "只删除这个位置，不会删除节点本身。"
+        )
+        if other_positions:
+            text += f"\n该节点还保留在另外 {other_positions} 个位置。"
+        else:
+            text += (
+                "\n该节点没有其他位置，移除后会成为根节点并显示在顶层。"
+            )
+        text += "\n磁盘上的 PDF 文件不会被删除。"
+        answer = QMessageBox.question(
+            self,
+            "从当前父级移除",
+            text,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _detach_item(self, item: TreeItem) -> None:
+        if item.parent_item is None:
+            self.statusBar().showMessage("根节点没有父级位置，无法移除。", 4000)
+            return
+        parent_id = item.parent_item.node_id
+        node_id = item.node_id
+        if not self._confirm_detach(node_id, parent_id):
+            return
+
+        try:
+            removed = self.controller.detach_node(parent_id, node_id)
+        except (ValueError, sqlite3.Error) as error:
+            log_error(f"Could not detach node {node_id} from {parent_id}: {error}")
+            QMessageBox.warning(self, "无法移除位置", str(error))
+            return
+
+        if not removed:
+            self.statusBar().showMessage("该位置已不存在，请刷新后重试。", 4000)
+            self.refresh()
+            return
+
+        self.refresh()
+        self._reveal_node(node_id)
+        self.statusBar().showMessage(
+            f"已从「{self._node_name(parent_id)}」中移除「{self._node_name(node_id)}」。",
+            5000,
+        )
+
+    # --- delete completely ----------------------------------------------------
+    def _delete_for_selection(self) -> None:
+        item = self._current_item()
+        if item is None:
+            self.statusBar().showMessage("请先选择一个节点。", 3000)
+            return
+        self._delete_node(item.node_id)
+
+    def _confirm_delete_node(self, node_id: int) -> bool:
+        node = self.controller.get_node(node_id)
+        if node is None:
+            return False
+        parents = self.controller.get_node_parents(node_id)
+        child_count = len(self.controller.get_node_children(node_id))
+
+        lines = [f"确定要彻底删除节点「{node.name}」吗？", ""]
+        if parents:
+            lines.append(
+                f"该节点当前被 {len(parents)} 个位置引用，"
+                "彻底删除后所有位置中的该节点都会消失："
+            )
+            for parent in parents[:5]:
+                lines.append(f"• {parent.name} > {node.name}")
+            if len(parents) > 5:
+                lines.append("…")
+        else:
+            lines.append("该节点位于顶层（没有父级），彻底删除后会从书库中消失。")
+        if child_count:
+            lines.append(
+                f"该节点还有 {child_count} 个子节点；子节点本身不会被删除，"
+                "但会失去这个父级位置。"
+            )
+        lines.extend(["", "磁盘上的 PDF 文件不会被删除。", "此操作不可撤销。"])
+
+        answer = QMessageBox.question(
+            self,
+            "彻底删除节点",
+            "\n".join(lines),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _delete_node(self, node_id: int) -> None:
+        node = self.controller.get_node(node_id)
+        if node is None:
+            QMessageBox.warning(self, "无法删除", "节点不存在，请刷新后重试。")
+            self.refresh()
+            return
+        if not self._confirm_delete_node(node_id):
+            return
+
+        try:
+            self.controller.delete_node_completely(node_id)
+        except (ValueError, sqlite3.Error) as error:
+            log_error(f"Could not delete node {node_id}: {error}")
+            QMessageBox.warning(self, "无法删除节点", str(error))
+            return
+
+        self.refresh()
+        self.statusBar().showMessage(f"已彻底删除节点「{node.name}」。", 5000)
+
+    # --- drag and drop --------------------------------------------------------
+    def _on_drop_rejected(self, reason: str) -> None:
+        self.statusBar().showMessage(reason, 6000)
+
+    def _on_nodes_dropped(
+        self,
+        source_paths,
+        target_node_id: int,
+    ) -> None:
+        paths = [
+            tuple(int(part) for part in path)
+            for path in source_paths or ()
+            if path
+        ]
+        if not paths:
+            return
+        target = self.controller.get_node(int(target_node_id))
+        if target is None:
+            self.statusBar().showMessage("目标节点不存在，请刷新后重试。", 5000)
+            return
+
+        action = self._prompt_drop_action(paths, target)
+        if action == "attach":
+            node_ids: List[int] = []
+            for path in paths:
+                if path[-1] not in node_ids:
+                    node_ids.append(path[-1])
+            self._attach_nodes_to_parent(node_ids, target.id)
+        elif action == "move":
+            if len(paths) != 1:
+                self.statusBar().showMessage(
+                    "一次只能移动一个位置；多选拖动请选择「关联到此位置」。", 5000
+                )
+                return
+            self._move_node_from_path(paths[0], target.id)
+
+    def _prompt_drop_action(self, source_paths, target) -> Optional[str]:
+        """
+        Ask whether the drop creates an additional position or moves one.
+
+        ``plan.md §31.2`` requires the two operations to stay visibly distinct:
+        associating adds an edge, moving also deletes the source edge.
+        """
+        menu = QMenu(self.tree_view)
+
+        if len(source_paths) == 1:
+            source_name = self._node_name(source_paths[0][-1])
+            menu.setTitle(f"{source_name} → {target.name}")
+        else:
+            menu.setTitle(f"{len(source_paths)} 个节点 → {target.name}")
+
+        attach_action = menu.addAction("关联到此位置")
+        attach_action.setStatusTip("新增一个父级位置，原位置保留")
+
+        move_action = menu.addAction("移动到此位置")
+        move_action.setStatusTip("删除原位置，再放到这个父级下")
+        move_action.setEnabled(len(source_paths) == 1 and len(source_paths[0]) > 1)
+
+        menu.addSeparator()
+        cancel_action = menu.addAction("取消")
+
+        chosen = menu.exec(QCursor.pos())
+        if chosen is attach_action:
+            return "attach"
+        if chosen is move_action:
+            return "move"
+        if chosen is cancel_action:
+            return None
+        return None
+
+    def _on_reorder_dropped(
+        self,
+        source_path,
+        target_path,
+        before: bool,
+    ) -> None:
+        source = tuple(int(part) for part in source_path)
+        target = tuple(int(part) for part in target_path)
+        if len(source) < 2 or len(target) < 2:
+            return
+        if source[:-1] != target[:-1]:
+            self.statusBar().showMessage(
+                "只能在同一个父级下调整顺序。", 5000
+            )
+            return
+
+        parent_id = source[-2]
+        try:
+            changed = self.controller.reorder_relative(
+                parent_id, source[-1], target[-1], before=before
+            )
+        except (ValueError, sqlite3.Error) as error:
+            log_error(f"Could not reorder nodes below {parent_id}: {error}")
+            QMessageBox.warning(self, "无法调整顺序", str(error))
+            return
+
+        self.refresh()
+        self._reveal_display_path(source)
+        self.statusBar().showMessage(
+            "已调整节点顺序。" if changed else "顺序没有变化。", 4000
+        )
+
+    # --------------------------------------------------------------------------
     # File checks / settings
     # --------------------------------------------------------------------------
     def _inspect_pdfs(self) -> None:
@@ -674,9 +1199,31 @@ class MainWindow(QMainWindow):
             refresh_action.triggered.connect(self.refresh)
             return menu
 
+        item = self.model.item_from_index(index)
+        display_path = item.display_path if item is not None else (node_id,)
+        has_parent = item is not None and item.parent_item is not None
+
         child_action = menu.addAction("新建子节点…")
         child_action.setData(node_id)
         child_action.triggered.connect(lambda: self._create_child_node(node_id))
+        menu.addSeparator()
+
+        attach_action = menu.addAction("关联到其他位置…")
+        attach_action.setData(node_id)
+        attach_action.triggered.connect(lambda: self._attach_node(node_id))
+
+        move_action = menu.addAction("移动到其他位置…")
+        move_action.setData(node_id)
+        move_action.setEnabled(has_parent)
+        move_action.triggered.connect(
+            lambda: self._move_node_from_path(display_path)
+        )
+
+        positions_action = menu.addAction("查看所有位置…")
+        positions_action.setData(node_id)
+        positions_action.triggered.connect(
+            lambda: self._show_positions(node_id, display_path)
+        )
         menu.addSeparator()
 
         edit_action = menu.addAction("编辑属性…")
@@ -687,7 +1234,6 @@ class MainWindow(QMainWindow):
         style_action.triggered.connect(lambda: self._edit_node(node_id, True))
         menu.addSeparator()
 
-        item = self.model.item_from_index(index)
         pdf_count = (
             len(item.node.pdf_paths)
             if item is not None and item.node is not None
@@ -718,6 +1264,16 @@ class MainWindow(QMainWindow):
                 select_path=missing_paths[0] if missing_paths else None,
             )
         )
+        menu.addSeparator()
+
+        detach_action = menu.addAction("从当前父级移除")
+        detach_action.setData(node_id)
+        detach_action.setEnabled(has_parent)
+        detach_action.triggered.connect(lambda: self._detach_item(item))
+
+        delete_action = menu.addAction("彻底删除节点…")
+        delete_action.setData(node_id)
+        delete_action.triggered.connect(lambda: self._delete_node(node_id))
         menu.addSeparator()
 
         expand_action = menu.addAction("展开")

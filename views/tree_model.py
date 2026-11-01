@@ -169,6 +169,11 @@ class TreeModel(QAbstractItemModel):
         item = self.item_from_index(index)
         return item.node_id if item is not None else None
 
+    def display_path_for_index(self, index: QModelIndex) -> DisplayPath:
+        """Return the display path behind a QModelIndex, or () when invalid."""
+        item = self.item_from_index(index)
+        return item.display_path if item is not None else ()
+
     # --------------------------------------------------------------------------
     # Building / refreshing
     # --------------------------------------------------------------------------
@@ -411,8 +416,14 @@ class TreeModel(QAbstractItemModel):
     def flags(self, index: QModelIndex) -> Qt.ItemFlag:
         if not index.isValid():
             return Qt.ItemFlag.NoItemFlags
-        # Editing happens through the property dialog; dragging arrives in Phase 5.
-        return Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+        # Editing happens through the property dialog; the view starts a drag
+        # from any row (Phase 5). Dropping is handled by LibraryTreeView so the
+        # model deliberately does not advertise ItemIsDropEnabled.
+        return (
+            Qt.ItemFlag.ItemIsEnabled
+            | Qt.ItemFlag.ItemIsSelectable
+            | Qt.ItemFlag.ItemIsDragEnabled
+        )
 
     # --------------------------------------------------------------------------
     # Presentation helpers

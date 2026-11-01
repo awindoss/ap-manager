@@ -172,6 +172,13 @@ A threshold or pattern used to control certain specific behaviours."""
 
 DEFAULT_SORT_ORDER_INCREMENT: Final[int] = 1
 
+# Custom drag-and-drop payload used by LibraryTreeView (Phase 5). The payload is
+# JSON: {"paths": [[root_id, ..., node_id], ...]} so a drag keeps the exact
+# display instance (important for "move from this parent").
+NODE_DRAG_MIME_TYPE: Final[str] = "application/x-ap-manager-node-paths"
+DRAG_HIGHLIGHT_ALPHA: Final[int] = 70
+DRAG_REORDER_LINE_HEIGHT: Final[int] = 3
+
 # Tree projection guards (Phase 2).
 # The graph is projected onto a tree; a corrupted dataset could otherwise make
 # the projection grow without bound (a cycle, or a diamond-shaped DAG whose

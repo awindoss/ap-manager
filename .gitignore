@@ -8,6 +8,10 @@ env/
 
 # --- Testing ---
 .pytest_cache/
+# Temp dirs pytest/the sandbox create with mode 0o700 (unreadable to confined tools)
+pytest-cache-files-*/
+.pytest_probe/
+.pytest_tmp/
 
 # --- Application runtime artifacts (see _mds/plan.md §5 / utils/constants.py) ---
 logs/

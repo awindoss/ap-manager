@@ -7,11 +7,12 @@
 # the Database) and exposes the few operations the views need. As later phases
 # add editing, PDF opening and import/export, those entry points belong here.
 # ==============================================================================
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+import sqlite3
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from models.library import LibraryService
+from models.library import GraphCycleError, LibraryService
 from models.node import Node, normalize_color, normalize_icon
 from services import path_manager
 from services.pdf_launcher import LaunchReport, PdfLaunchError, PdfLauncher
@@ -62,6 +63,64 @@ class PdfInspection:
     @property
     def existing_count(self) -> int:
         return self.total_pdfs - len(self.missing)
+
+
+@dataclass(frozen=True)
+class NodePosition:
+    """One root-to-node path (a display location) of a database node."""
+
+    node_id: int
+    path: Tuple[int, ...]
+    names: Tuple[str, ...]
+
+    @property
+    def label(self) -> str:
+        """Human-readable breadcrumb, e.g. ``经济政治 > 马列 > 马克思``."""
+        return " > ".join(self.names)
+
+
+@dataclass(frozen=True)
+class AttachResult:
+    """Outcome of a batch "attach to other location(s)" request.
+
+    Pairs are ``(parent_id, child_id)`` so both the "one child, many parents"
+    (context menu) and "many children, one parent" (drag and drop) directions
+    can share the same result type.
+    """
+
+    attached: List[Tuple[int, int]] = field(default_factory=list)
+    already: List[Tuple[int, int]] = field(default_factory=list)
+    errors: List[Tuple[Tuple[int, int], str]] = field(default_factory=list)
+
+    @property
+    def has_changes(self) -> bool:
+        return bool(self.attached)
+
+    @property
+    def has_errors(self) -> bool:
+        return bool(self.errors)
+
+
+@dataclass(frozen=True)
+class MoveOutcome:
+    """Result of moving one display instance to another parent.
+
+    ``kind`` is one of:
+      * ``"moved"``    - the edge was moved to the new parent;
+      * ``"merged"``   - the target already had the node, the source edge was removed;
+      * ``"attached"`` - a root instance (no source edge) was attached to the target;
+      * ``"already"``  - a root instance that is already attached to the target;
+      * ``"same"``     - source and target parents are identical.
+    """
+
+    kind: str
+    old_parent_id: Optional[int]
+    new_parent_id: int
+    child_id: int
+
+    @property
+    def moved(self) -> bool:
+        return self.kind in ("moved", "merged", "attached")
 
 
 class AppController:
@@ -116,6 +175,225 @@ class AppController:
     def get_parent_count_map(self) -> Dict[int, int]:
         """Return ``{node_id: parent_count}`` for badge rendering."""
         return self.library.get_parent_count_map()
+
+    def get_all_nodes(self) -> List[Node]:
+        """Every node in the library, ordered by id."""
+        return self.library.get_all_nodes()
+
+    def get_parent_ids(self, node_id: int) -> List[int]:
+        """Parent ids of ``node_id`` (one per incoming edge)."""
+        return self.library.get_parent_ids(node_id)
+
+    def has_edge(self, parent_id: int, child_id: int) -> bool:
+        """True when ``parent_id -> child_id`` already exists."""
+        return self.library.db.get_edge(parent_id, child_id) is not None
+
+    def would_create_cycle(self, parent_id: int, child_id: int) -> bool:
+        """True when attaching ``child_id`` below ``parent_id`` would cycle."""
+        return self.library.would_create_cycle(parent_id, child_id)
+
+    def get_descendant_ids(self, node_id: int) -> List[int]:
+        """Every node below ``node_id`` (transitively, excluding itself)."""
+        return self.library.get_descendant_ids(node_id)
+
+    def get_node_positions(self, node_id: int) -> List[NodePosition]:
+        """
+        Every root-to-node path of a node, with names resolved for the UI.
+
+        A node inside a cycle-only component has no root path and therefore
+        returns an empty list (plan.md §10); callers must handle that case.
+        """
+        node = self._require_node(node_id)
+        paths = self.library.get_node_paths(node_id)
+        name_cache: Dict[int, str] = {node_id: node.name}
+
+        positions: List[NodePosition] = []
+        for raw_path in paths:
+            path = tuple(int(part) for part in raw_path)
+            names: List[str] = []
+            for part_id in path:
+                if part_id not in name_cache:
+                    part = self.library.get_node(part_id)
+                    name_cache[part_id] = part.name if part is not None else f"#{part_id}"
+                names.append(name_cache[part_id])
+            positions.append(
+                NodePosition(node_id=node_id, path=path, names=tuple(names))
+            )
+        return positions
+
+    # --------------------------------------------------------------------------
+    # Multi-parent relations (Phase 5)
+    # --------------------------------------------------------------------------
+    def attach_node_to_parents(
+        self,
+        child_id: int,
+        parent_ids: List[int],
+    ) -> AttachResult:
+        """Attach one node below one or more additional parents."""
+        pairs = [(parent_id, child_id) for parent_id in parent_ids or ()]
+        return self._attach_pairs(pairs)
+
+    def attach_nodes_to_parent(
+        self,
+        child_ids: List[int],
+        parent_id: int,
+    ) -> AttachResult:
+        """Attach several nodes below one parent (drag and drop source set)."""
+        pairs = [(parent_id, child_id) for child_id in child_ids or ()]
+        return self._attach_pairs(pairs)
+
+    def _attach_pairs(
+        self,
+        pairs: List[Tuple[int, int]],
+    ) -> AttachResult:
+        """
+        Attach ``(parent, child)`` pairs one by one.
+
+        Duplicates, self-links, missing nodes and cycle-producing pairs are
+        collected as per-pair results instead of aborting the whole batch, so
+        dragging a multi-selection still attaches every legal node.
+        """
+        result = AttachResult()
+        seen_pairs = set()
+
+        for parent_id, child_id in pairs:
+            pair = (int(parent_id), int(child_id))
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+
+            parent = self.library.get_node(pair[0])
+            child = self.library.get_node(pair[1])
+            if parent is None or child is None:
+                result.errors.append((pair, "节点不存在，可能已被删除，请刷新后重试。"))
+                continue
+            if pair[0] == pair[1]:
+                result.errors.append((pair, "不能把节点关联到它自身。"))
+                continue
+            if self.has_edge(pair[0], pair[1]):
+                result.already.append(pair)
+                continue
+            if self.would_create_cycle(pair[0], pair[1]):
+                result.errors.append((pair, self._cycle_message(pair[0], pair[1])))
+                continue
+
+            try:
+                self.library.attach_nodes(pair[0], pair[1])
+            except (ValueError, sqlite3.Error) as error:
+                result.errors.append((pair, str(error)))
+            except Exception as error:  # defensive: never abort the batch
+                log_error(
+                    f"Could not attach {pair[1]} below {pair[0]}: {error}"
+                )
+                result.errors.append((pair, f"数据库写入失败：{error}"))
+            else:
+                result.attached.append(pair)
+
+        if result.has_changes:
+            log_info(
+                f"Attached {len(result.attached)} location(s); "
+                f"{len(result.already)} already existed, {len(result.errors)} rejected."
+            )
+        return result
+
+    def detach_node(self, parent_id: int, child_id: int) -> bool:
+        """
+        Remove exactly one position (edge), leaving the node and its other
+        positions untouched. Returns True when an edge was removed.
+        """
+        self._require_node(child_id)
+        removed = self.library.detach_nodes(parent_id, child_id)
+        if removed:
+            log_info(f"Detached node {child_id} from parent {parent_id}.")
+        return removed
+
+    def delete_node_completely(self, node_id: int) -> None:
+        """Delete a node and every edge that references it (files stay on disk)."""
+        node = self._require_node(node_id)
+        self.library.delete_node_completely(node_id)
+        log_info(f"Permanently deleted node {node_id} ({node.name!r}).")
+
+    def move_node(
+        self,
+        old_parent_id: Optional[int],
+        child_id: int,
+        new_parent_id: int,
+    ) -> MoveOutcome:
+        """
+        Move one display instance to a new parent.
+
+        * A normal move deletes the old edge and inserts the new one atomically.
+        * Moving onto a parent that already contains the node simply removes the
+          old position ("merged"), which avoids violating the unique edge rule.
+        * A root instance has no edge to delete; "move" then behaves like an
+          attach and reports ``kind == "attached"``.
+        """
+        child = self._require_node(child_id)
+        new_parent = self._require_node(new_parent_id)
+
+        if old_parent_id is not None:
+            self._require_node(old_parent_id)
+        if old_parent_id == new_parent_id:
+            return MoveOutcome("same", old_parent_id, new_parent_id, child_id)
+        if new_parent_id == child_id:
+            raise GraphCycleError(
+                f"无法移动：「{child.name}」不能放到它自己下面。"
+            )
+        if old_parent_id is not None and not self.has_edge(old_parent_id, child_id):
+            raise ValueError("原位置已不存在，请刷新后重试。")
+
+        target_exists = self.has_edge(new_parent_id, child_id)
+        if target_exists:
+            if old_parent_id is None:
+                return MoveOutcome("already", None, new_parent_id, child_id)
+            self.library.detach_nodes(old_parent_id, child_id)
+            log_info(
+                f"Moved node {child_id} to existing position below {new_parent_id}; "
+                f"old edge from {old_parent_id} removed."
+            )
+            return MoveOutcome("merged", old_parent_id, new_parent_id, child_id)
+
+        if self.would_create_cycle(new_parent_id, child_id):
+            raise GraphCycleError(self._cycle_message(new_parent_id, child_id))
+
+        if old_parent_id is None:
+            self.library.attach_nodes(new_parent_id, child_id)
+            log_info(f"Attached root node {child_id} below {new_parent_id}.")
+            return MoveOutcome("attached", None, new_parent_id, child_id)
+
+        if not self.library.move_node(old_parent_id, child_id, new_parent_id):
+            raise ValueError("移动失败，请刷新后重试。")
+        log_info(
+            f"Moved node {child_id} from parent {old_parent_id} to {new_parent_id}."
+        )
+        return MoveOutcome("moved", old_parent_id, new_parent_id, child_id)
+
+    def reorder_relative(
+        self,
+        parent_id: int,
+        child_id: int,
+        target_child_id: int,
+        before: bool = True,
+    ) -> bool:
+        """Move one sibling before/after another sibling (drag sorting)."""
+        return self.library.reorder_relative(
+            parent_id, child_id, target_child_id, before=before
+        )
+
+    def reorder_children(self, parent_id: int, ordered_child_ids: List[int]) -> bool:
+        """Replace the whole sibling order below one parent."""
+        return self.library.reorder_children(parent_id, ordered_child_ids)
+
+    def _cycle_message(self, parent_id: int, child_id: int) -> str:
+        """User-facing explanation for a rejected cycle-producing operation."""
+        parent = self.library.get_node(parent_id)
+        child = self.library.get_node(child_id)
+        parent_name = parent.name if parent is not None else f"#{parent_id}"
+        child_name = child.name if child is not None else f"#{child_id}"
+        return (
+            f"无法完成操作：把「{child_name}」放到「{parent_name}」下面会形成循环引用。"
+            "请选择其上级之外的另一个位置。"
+        )
 
     # --------------------------------------------------------------------------
     # Editing (Phase 3)

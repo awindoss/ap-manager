@@ -154,6 +154,15 @@ VALID_PDF_EXTENSIONS: Final[tuple[str, ...]] = (".pdf",)
 VALID_ANNOTATION_EXTENSIONS: Final[tuple[str, ...]] = (".fdf",)
 WARNING_ICON_MISSING_FILE: Final[str] = "⚠️"
 
+# File dialog filters (UI strings, kept here so phase 6 import/export can reuse them).
+PDF_FILE_FILTER: Final[str] = "PDF 文件 (*.pdf)"
+MAX_PDF_PATH_LENGTH: Final[int] = 4096
+# Streamed hashing/copying of PDF files: books can be large, so never read a
+# whole PDF into memory just to compare or duplicate it.
+PDF_COPY_CHUNK_SIZE: Final[int] = 1024 * 1024
+# Suffix used when a copied PDF's name is already taken by a different file.
+PDF_COPY_NAME_SUFFIX_FORMAT: Final[str] = "{stem}_{digest}{suffix}"
+
 
 # --------------------------------------------------------------------------
 # 8.Business Logic Constants

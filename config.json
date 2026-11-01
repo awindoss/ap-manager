@@ -1,6 +1,7 @@
 {
     "pdf_reader": {
-        "path": ""
+        "path": "",
+        "args": ""
     },
 
     "ui": {

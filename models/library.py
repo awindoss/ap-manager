@@ -3,7 +3,8 @@
 # Business logic layer: encapsulates database operations and handles core business rules (such as cyclic checks and node hierarchy navigation)
 # ==============================================================================
 from pathlib import Path
-from typing import Optional, List, Dict
+from typing import Iterable, Optional, List, Dict
+import os
 import sqlite3
 
 from models.database import Database
@@ -179,3 +180,167 @@ class LibraryService:
     def get_node_paths(self, node_id: int) -> List[List[int]]:
         """Retrieve all paths leading to this node from any root node (for UI expansion and positioning)"""
         return self.db.get_all_positions(node_id)
+
+    # --------------------------------------------------------------------------
+    # PDF references (Phase 4)
+    # --------------------------------------------------------------------------
+    def get_pdf_list(self, node_id: int) -> List[str]:
+        """Return the stored PDF paths of a node, in display order."""
+        return list(self._require_node(node_id).pdf_paths)
+
+    def set_pdf_list(self, node_id: int, pdf_paths: Iterable[object]) -> None:
+        """
+        Replace the whole PDF list of a node.
+
+        Empty entries are dropped and duplicates are removed while preserving
+        the first occurrence, so a hand-edited or imported list cannot leave the
+        node with two references to the same file.
+        """
+        self._require_node(node_id)
+        cleaned = self._dedupe_pdf_paths(pdf_paths)
+        self.db.update_node(node_id, pdf_paths=cleaned)
+        log_info(f"Node {node_id} PDF list set to {len(cleaned)} reference(s).")
+
+    def add_pdf(self, node_id: int, pdf_path: object) -> bool:
+        """Attach one PDF reference; returns False when it was already present."""
+        if not self._clean_pdf_path(pdf_path):
+            raise ValueError("PDF 路径不能为空。")
+        return bool(self.add_pdfs(node_id, [pdf_path]))
+
+    def add_pdfs(self, node_id: int, pdf_paths: Iterable[object]) -> List[str]:
+        """
+        Attach several PDF references in one database write.
+
+        Returns the paths that were actually added. Duplicates (same file,
+        case-insensitively on Windows) are skipped instead of being an error,
+        which keeps "add a folder of PDFs twice" harmless.
+        """
+        node = self._require_node(node_id)
+        # Hand-edited or imported data may contain duplicate spellings; clean
+        # them while writing so the stored list stays canonical.
+        current = self._dedupe_pdf_paths(node.pdf_paths)
+        keys = {self._pdf_key(path) for path in current if path}
+
+        added: List[str] = []
+        for raw in pdf_paths or ():
+            path = self._clean_pdf_path(raw)
+            if not path:
+                continue
+            key = self._pdf_key(path)
+            if key in keys:
+                continue
+            keys.add(key)
+            current.append(path)
+            added.append(path)
+
+        if added:
+            self.db.update_node(node_id, pdf_paths=current)
+            log_info(f"Node {node_id} gained {len(added)} PDF reference(s).")
+        return added
+
+    def remove_pdf(self, node_id: int, pdf_path: object) -> bool:
+        """Detach one PDF reference; returns False when it was not attached."""
+        return self.remove_pdfs(node_id, [pdf_path]) > 0
+
+    def remove_pdfs(self, node_id: int, pdf_paths: Iterable[object]) -> int:
+        """
+        Detach several PDF references in one database write.
+
+        Only the database reference is removed; the file on disk is never
+        touched (plan.md §40: classification deletion != file deletion).
+        """
+        node = self._require_node(node_id)
+        keys = {
+            self._pdf_key(path)
+            for path in pdf_paths or ()
+            if self._clean_pdf_path(path)
+        }
+        if not keys:
+            return 0
+
+        remaining = [path for path in node.pdf_paths if self._pdf_key(path) not in keys]
+        removed = len(node.pdf_paths) - len(remaining)
+        if removed:
+            self.db.update_node(node_id, pdf_paths=remaining)
+            log_info(f"Node {node_id} lost {removed} PDF reference(s).")
+        return removed
+
+    def relink_pdf(
+        self,
+        node_id: int,
+        old_pdf_path: object,
+        new_pdf_path: object,
+    ) -> bool:
+        """
+        Point an existing reference at a different file, keeping its position.
+
+        Used by "re-locate missing PDF" (plan.md §22): the classification stays
+        exactly where it was, only the path changes. Returns False when the old
+        path is not attached or the new path equals it.
+        """
+        node = self._require_node(node_id)
+        old_clean = self._clean_pdf_path(old_pdf_path)
+        new_clean = self._clean_pdf_path(new_pdf_path)
+        if not old_clean or not new_clean:
+            raise ValueError("PDF 路径不能为空。")
+
+        old_key = self._pdf_key(old_clean)
+        current = list(node.pdf_paths)
+        current_keys = {self._pdf_key(path) for path in current}
+        if old_key not in current_keys:
+            return False
+
+        new_key = self._pdf_key(new_clean)
+        if new_key != old_key and new_key in current_keys:
+            # The replacement is already attached: leave the list untouched so
+            # the caller can report a duplicate instead of silently merging.
+            return False
+
+        updated = [new_clean if self._pdf_key(path) == old_key else path for path in current]
+        updated = self._dedupe_pdf_paths(updated)
+
+        if updated == current:
+            return False
+        if new_key == old_key:
+            return False
+
+        self.db.update_node(node_id, pdf_paths=updated)
+        log_info(f"Node {node_id} re-linked a PDF reference.")
+        return True
+
+    # --------------------------------------------------------------------------
+    # PDF helpers
+    # --------------------------------------------------------------------------
+    def _require_node(self, node_id: int) -> Node:
+        node = self.db.get_node(node_id)
+        if node is None:
+            log_error(f"Node {node_id} does not exist.")
+            raise ValueError(f"节点 {node_id} 不存在。")
+        return node
+
+    @staticmethod
+    def _clean_pdf_path(pdf_path: object) -> str:
+        return "" if pdf_path is None else str(pdf_path).strip()
+
+    @staticmethod
+    def _pdf_key(pdf_path: object) -> str:
+        """Comparison key: normalised, case-insensitive on Windows."""
+        text = "" if pdf_path is None else str(pdf_path).strip()
+        if not text:
+            return ""
+        return os.path.normcase(os.path.normpath(text))
+
+    @classmethod
+    def _dedupe_pdf_paths(cls, pdf_paths: Iterable[object]) -> List[str]:
+        cleaned: List[str] = []
+        seen = set()
+        for raw in pdf_paths or ():
+            path = cls._clean_pdf_path(raw)
+            if not path:
+                continue
+            key = cls._pdf_key(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(path)
+        return cleaned

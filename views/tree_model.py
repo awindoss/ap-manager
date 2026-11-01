@@ -529,8 +529,8 @@ class TreeModel(QAbstractItemModel):
             log_debug(f"Node {node_id} has no display instance; nothing to repaint.")
             return False
 
-        # The PDF list is not editable in Phase 3, but keeping this cache in sync
-        # costs nothing and makes the method safe for Phase 4 updates.
+        # The PDF list is edited in the PDF manager, but keeping this cache in
+        # sync costs nothing and lets the node repaint after any PDF change.
         if node.pdf_paths:
             missing = path_manager.missing_pdf_paths(node.pdf_paths)
             if missing:

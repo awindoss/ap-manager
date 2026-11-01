@@ -27,7 +27,9 @@ class NodePropertiesDialog(QDialog):
     """
     Edit an existing node.
 
-    PDFs are shown read-only here; managing them is Phase 4 (stage.md 3.5).
+    PDFs are shown read-only here; they are managed in
+    :class:`~views.dialogs.pdf_management_dialog.PdfManagementDialog`
+    (stage.md 3.5 / 4.4).
     Like :class:`AddNodeDialog` the dialog only reports the differences, so the
     controller remains the only component that writes to the library.
     """
@@ -74,7 +76,7 @@ class NodePropertiesDialog(QDialog):
         pdf_layout.addWidget(self.pdf_list)
 
         if not self._node.pdf_paths:
-            hint = QLabel("（暂无 PDF，PDF 管理将在 Phase 4 提供）", self)
+            hint = QLabel("（暂无 PDF；右键菜单「管理 PDF…」可添加）", self)
             hint.setObjectName("pdfHint")
             pdf_layout.addWidget(hint)
 

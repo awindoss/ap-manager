@@ -186,3 +186,81 @@ def test_describe_pdf_reports_presence_and_paths(tmp_path) -> None:
 
     described_many = path_manager.describe_pdfs(["books/a.pdf", "books/gone.pdf"], base_root=root)
     assert [entry.missing for entry in described_many] == [False, True]
+
+
+# ------------------------------------------------------------------------------
+# Phase 6: export / import reference conversion
+# ------------------------------------------------------------------------------
+def test_make_export_reference_uses_dot_slash_for_relative_paths(tmp_path) -> None:
+    root = tmp_path / "app"
+    pdf = make_pdf(root / "books" / "a.pdf")
+    export_dir = root / "exports" / "lib"
+
+    reference, absolute, exists = path_manager.make_export_reference(
+        "books/a.pdf", export_dir, base_root=root
+    )
+
+    assert reference == "../../books/a.pdf"
+    assert absolute is not None and absolute.resolve() == pdf.resolve()
+    assert exists is True
+
+
+def test_make_export_reference_prefixes_a_path_inside_the_export_dir(tmp_path) -> None:
+    root = tmp_path / "app"
+    make_pdf(root / "exports" / "books" / "a.pdf")
+    export_dir = root / "exports"
+
+    reference, _absolute, exists = path_manager.make_export_reference(
+        "exports/books/a.pdf", export_dir, base_root=root
+    )
+
+    assert reference == "./books/a.pdf"
+    assert exists is True
+
+
+def test_make_export_reference_reports_missing_files(tmp_path) -> None:
+    root = tmp_path / "app"
+    reference, absolute, exists = path_manager.make_export_reference(
+        "books/gone.pdf", root / "export", base_root=root
+    )
+
+    assert reference.endswith("books/gone.pdf")
+    assert absolute is not None
+    assert exists is False
+
+
+def test_resolve_imported_reference_rebases_onto_the_target_root(tmp_path) -> None:
+    target_root = tmp_path / "target"
+    source_dir = target_root / "portable"
+    pdf = make_pdf(source_dir / "books" / "a.pdf")
+
+    stored, absolute, exists = path_manager.resolve_imported_reference(
+        "./books/a.pdf", source_dir, base_root=target_root
+    )
+
+    assert stored == "portable/books/a.pdf"
+    assert absolute is not None and absolute.resolve() == pdf.resolve()
+    assert exists is True
+
+
+def test_resolve_imported_reference_keeps_paths_outside_the_root_absolute(tmp_path) -> None:
+    source_dir = tmp_path / "exported"
+    target_root = tmp_path / "target"
+    pdf = make_pdf(source_dir / "books" / "a.pdf")
+
+    stored, _absolute, exists = path_manager.resolve_imported_reference(
+        "./books/a.pdf", source_dir, base_root=target_root
+    )
+
+    assert stored == pdf.as_posix()
+    assert exists is True
+
+
+def test_resolve_imported_reference_does_not_require_the_file(tmp_path) -> None:
+    stored, absolute, exists = path_manager.resolve_imported_reference(
+        "./books/gone.pdf", tmp_path / "exported", base_root=tmp_path
+    )
+
+    assert stored == "exported/books/gone.pdf"
+    assert absolute is not None
+    assert exists is False

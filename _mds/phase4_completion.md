@@ -155,7 +155,7 @@ D:\Anaconda\envs\pyside\python.exe -m pytest
 > 目录不可列举。本次沿用 Phase 3 的本地启动器放宽目录模式后运行，启动器未纳入
 > 版本库；普通开发机直接使用上面的命令即可。
 
-> 版本库备注：当前环境 PATH 中没有 `git`，因此未执行提交操作。
+> 版本库备注：后续已补提交为 `238e604`（Phase 4 complete）。
 
 ---
 

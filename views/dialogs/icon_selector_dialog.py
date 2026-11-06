@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 )
 
 from utils import constants
+from utils.error_messages import describe_error
 from utils.icon_utils import import_custom_icon, is_custom_icon, load_icon
 from utils.logger import log_info
 
@@ -174,7 +175,7 @@ class IconSelectorDialog(QDialog):
         try:
             relative_path = import_custom_icon(Path(path))
         except (OSError, ValueError) as error:
-            QMessageBox.warning(self, "无法使用该图片", str(error))
+            QMessageBox.warning(self, "无法使用该图片", describe_error(error))
             return
 
         self._cleared = False

@@ -178,6 +178,88 @@ def relative_to_root(path: str | Path, root: str | Path) -> Optional[str]:
     return relative.as_posix()
 
 
+def make_export_reference(
+    stored_path: object,
+    export_dir: str | Path,
+    *,
+    base_root: Optional[Path] = None,
+) -> tuple[str, Optional[Path], bool]:
+    """
+    Convert a stored PDF reference into the path written to ``library.json``.
+
+    The reference is made relative to ``export_dir`` (plan.md §21.2) whenever
+    both paths live on the same drive; a relative form is prefixed with ``./``
+    so it is visually distinct from a bare relative path and matches the format
+    shown in the plan. Different drives cannot be expressed relatively on
+    Windows, so the absolute path is kept unchanged.
+
+    Returns ``(reference, absolute_path, exists)``; an empty stored value yields
+    ``("", None, False)``.
+    """
+    stored = normalize_stored_path(stored_path)
+    if not stored:
+        return "", None, False
+
+    try:
+        absolute = Path(os.path.abspath(normalize_path(stored, base_root=base_root)))
+    except (OSError, ValueError):
+        return stored, None, False
+
+    exists = absolute.is_file()
+    export_root = Path(os.path.abspath(Path(export_dir).expanduser()))
+
+    try:
+        relative = os.path.relpath(str(absolute), str(export_root))
+    except ValueError:
+        # Different drives (Windows): no relative form exists.
+        return absolute.as_posix(), absolute, exists
+
+    reference = Path(relative).as_posix()
+    if reference.startswith("../") or reference == "..":
+        return reference, absolute, exists
+    if not reference.startswith("./"):
+        reference = "./" + reference
+    return reference, absolute, exists
+
+
+def resolve_imported_reference(
+    reference: object,
+    source_dir: str | Path,
+    *,
+    base_root: Optional[Path] = None,
+) -> tuple[str, Optional[Path], bool]:
+    """
+    Resolve one ``pdfs`` entry from an imported document.
+
+    Relative entries are resolved against the directory that contains
+    ``library.json``; absolute entries are kept as-is. The result is then stored
+    in the canonical application form: relative to ``base_root`` when the file
+    lies inside the portable tree, absolute otherwise (``make_stored_path``
+    policy). The file does not have to exist — a missing PDF is reported by the
+    caller and never aborts the import (plan.md §24).
+
+    Returns ``(stored_path, absolute_path, exists)``; an empty reference yields
+    ``("", None, False)``.
+    """
+    text = normalize_stored_path(reference)
+    if not text:
+        return "", None, False
+
+    candidate = Path(text).expanduser()
+    if not candidate.is_absolute():
+        candidate = Path(source_dir) / candidate
+
+    try:
+        absolute = Path(os.path.abspath(candidate))
+    except (OSError, ValueError):
+        return text, None, False
+
+    root = Path(base_root) if base_root is not None else Path(constants.BASE_ROOT)
+    relative = relative_to_root(absolute, root)
+    stored = relative if relative is not None else absolute.as_posix()
+    return normalize_stored_path(stored), absolute, absolute.is_file()
+
+
 def make_stored_path(
     source_path: str | Path,
     *,

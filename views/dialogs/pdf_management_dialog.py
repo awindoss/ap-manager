@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 from services.path_manager import PdfFile
 from services.pdf_launcher import LaunchReport
 from utils import constants
+from utils.error_messages import describe_error
 from utils.logger import log_info
 
 if TYPE_CHECKING:  # pragma: no cover - type checking only
@@ -219,7 +220,7 @@ class PdfManagementDialog(QDialog):
                 copy_to_books=self.copy_check.isChecked(),
             )
         except (ValueError, OSError, sqlite3.Error) as error:
-            QMessageBox.warning(self, "无法添加 PDF", str(error))
+            QMessageBox.warning(self, "无法添加 PDF", describe_error(error))
             return
 
         self.reload(select_paths=result.added)
@@ -265,7 +266,7 @@ class PdfManagementDialog(QDialog):
                 [pdf_file.stored_path for pdf_file in selected],
             )
         except (ValueError, OSError, sqlite3.Error) as error:
-            QMessageBox.warning(self, "无法移除 PDF", str(error))
+            QMessageBox.warning(self, "无法移除 PDF", describe_error(error))
             return
         self.reload(select_paths=None)
         self._set_status(f"已从节点移除 {removed} 个 PDF 引用。")
@@ -299,7 +300,7 @@ class PdfManagementDialog(QDialog):
                 copy_to_books=self.copy_check.isChecked(),
             )
         except (ValueError, OSError, sqlite3.Error) as error:
-            QMessageBox.warning(self, "无法重新定位 PDF", str(error))
+            QMessageBox.warning(self, "无法重新定位 PDF", describe_error(error))
             return
 
         self.reload(select_paths=[stored])
@@ -315,7 +316,7 @@ class PdfManagementDialog(QDialog):
                 [pdf_file.stored_path for pdf_file in selected]
             )
         except (ValueError, OSError, sqlite3.Error) as error:
-            QMessageBox.warning(self, "无法打开 PDF", str(error))
+            QMessageBox.warning(self, "无法打开 PDF", describe_error(error))
             return
         self._report_launch(report)
 
@@ -326,7 +327,7 @@ class PdfManagementDialog(QDialog):
         try:
             report = self._controller.open_node_pdfs(self._node_id)
         except (ValueError, OSError, sqlite3.Error) as error:
-            QMessageBox.warning(self, "无法打开 PDF", str(error))
+            QMessageBox.warning(self, "无法打开 PDF", describe_error(error))
             return
         self._report_launch(report)
 

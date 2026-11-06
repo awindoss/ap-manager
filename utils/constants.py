@@ -85,8 +85,28 @@ KEY_WINDOW_WIDTH: Final[str] = "window_width"
 KEY_WINDOW_HEIGHT: Final[str] = "window_height"
 KEY_WINDOW_X: Final[str] = "window_x"       # null indicates centre alignment
 KEY_WINDOW_Y: Final[str] = "window_y"
+KEY_WINDOW_MAXIMIZED: Final[str] = "window_maximized"
+# Expanded branches are stored as display paths (lists of node ids), not as a
+# flat node-id set: the same node can be expanded under one parent and collapsed
+# under another (multi-parent projection, plan.md §10).
+KEY_EXPANDED_PATHS: Final[str] = "expanded_paths"
+KEY_SEARCH_PANEL_VISIBLE: Final[str] = "search_panel_visible"
 DEFAULT_WINDOW_WIDTH: Final[int] = 1200
 DEFAULT_WINDOW_HEIGHT: Final[int] = 800
+DEFAULT_WINDOW_MAXIMIZED: Final[bool] = False
+MIN_WINDOW_WIDTH: Final[int] = 640
+MIN_WINDOW_HEIGHT: Final[int] = 480
+MAX_WINDOW_WIDTH: Final[int] = 10_000
+MAX_WINDOW_HEIGHT: Final[int] = 10_000
+# Guard against a config file growing without bound as the tree is expanded.
+MAX_SAVED_EXPANDED_PATHS: Final[int] = 500
+
+# Logging settings
+SECTION_LOGGING: Final[str] = "logging"
+KEY_LOG_LEVEL: Final[str] = "level"
+DEFAULT_LOG_LEVEL_NAME: Final[str] = "INFO"
+LOG_FILE_MAX_BYTES: Final[int] = 2 * 1024 * 1024
+LOG_FILE_BACKUP_COUNT: Final[int] = 3
 
 # --------------------------------------------------------------------------
 # 4.Database Schema Constants
@@ -125,6 +145,9 @@ LIBRARY_FORMAT_VERSION: Final[str] = "0.1"
 JSON_FORMAT_KEY: Final[str] = "format"
 VERSION_KEY: Final[str] = "version"
 LIBRARY_FORMAT_NAME: Final[str] = "ap_manager_library"
+# Versions the importer understands. A newer file must be rejected instead of
+# being imported with silently missing fields (plan.md §41).
+SUPPORTED_LIBRARY_VERSIONS: Final[tuple[str, ...]] = (LIBRARY_FORMAT_VERSION,)
 
 
 # --------------------------------------------------------------------------
@@ -156,6 +179,8 @@ WARNING_ICON_MISSING_FILE: Final[str] = "⚠️"
 
 # File dialog filters (UI strings, kept here so phase 6 import/export can reuse them).
 PDF_FILE_FILTER: Final[str] = "PDF 文件 (*.pdf)"
+LIBRARY_JSON_FILE_NAME: Final[str] = "library.json"
+LIBRARY_FILE_FILTER: Final[str] = "图书馆文件 (*.json);;所有文件 (*)"
 MAX_PDF_PATH_LENGTH: Final[int] = 4096
 # Streamed hashing/copying of PDF files: books can be large, so never read a
 # whole PDF into memory just to compare or duplicate it.
@@ -172,6 +197,28 @@ A threshold or pattern used to control certain specific behaviours."""
 
 DEFAULT_SORT_ORDER_INCREMENT: Final[int] = 1
 
+# Import behaviour (Phase 6). "merge" keeps the existing library and appends the
+# imported graph; "replace" clears the existing graph in the same transaction.
+IMPORT_MODE_MERGE: Final[str] = "merge"
+IMPORT_MODE_REPLACE: Final[str] = "replace"
+IMPORT_MODES: Final[tuple[str, ...]] = (IMPORT_MODE_MERGE, IMPORT_MODE_REPLACE)
+
+# Library exchange format keys (plan.md §23.2). Keeping them in one place makes
+# the exporter and the validator impossible to drift apart.
+JSON_NODES_KEY: Final[str] = "nodes"
+JSON_EDGES_KEY: Final[str] = "edges"
+JSON_NODE_ID_KEY: Final[str] = "id"
+JSON_NODE_NAME_KEY: Final[str] = "name"
+JSON_NODE_PDFS_KEY: Final[str] = "pdfs"
+JSON_NODE_ICON_KEY: Final[str] = "icon"
+JSON_NODE_STYLE_KEY: Final[str] = "style"
+JSON_STYLE_BOLD_KEY: Final[str] = "bold"
+JSON_STYLE_COLOR_KEY: Final[str] = "color"
+JSON_NODE_METADATA_KEY: Final[str] = "metadata"
+JSON_EDGE_PARENT_KEY: Final[str] = "parent"
+JSON_EDGE_CHILD_KEY: Final[str] = "child"
+JSON_EDGE_SORT_ORDER_KEY: Final[str] = "sort_order"
+
 # Custom drag-and-drop payload used by LibraryTreeView (Phase 5). The payload is
 # JSON: {"paths": [[root_id, ..., node_id], ...]} so a drag keeps the exact
 # display instance (important for "move from this parent").
@@ -186,6 +233,38 @@ DRAG_REORDER_LINE_HEIGHT: Final[int] = 3
 # gracefully and are reported by the model instead of freezing the GUI.
 TREE_MAX_DEPTH: Final[int] = 64
 TREE_MAX_ITEMS: Final[int] = 200_000
+
+
+# --------------------------------------------------------------------------
+# 8b.Search & relocation (Phase 7)
+# --------------------------------------------------------------------------
+# Search is synchronous (SQLite over a local file); a short debounce keeps the
+# view responsive while typing without adding an async worker.
+SEARCH_DEBOUNCE_MS: Final[int] = 250
+SEARCH_DEFAULT_LIMIT: Final[int] = 100
+SEARCH_MAX_LIMIT: Final[int] = 500
+SEARCH_MAX_QUERY_LENGTH: Final[int] = 200
+# Match sources reported by the search service. Kept as strings so the result
+# objects stay serialisable and easy to display in the UI.
+SEARCH_MATCH_NAME: Final[str] = "name"
+SEARCH_MATCH_PDF: Final[str] = "pdf"
+SEARCH_MATCH_LABELS: Final[dict[str, str]] = {
+    SEARCH_MATCH_NAME: "名称",
+    SEARCH_MATCH_PDF: "PDF",
+}
+# A node inside a cycle may have no root path at all; the result still exists
+# but has zero locations (plan.md §28).
+SEARCH_NO_LOCATION_TEXT: Final[str] = "（没有可达位置）"
+
+# Batch relocation (plan.md §22 / stage.md 7.2 "批量重新定位").
+RELINK_STATUS_MATCHED: Final[str] = "matched"
+RELINK_STATUS_AMBIGUOUS: Final[str] = "ambiguous"
+RELINK_STATUS_NOT_FOUND: Final[str] = "not_found"
+RELINK_STATUS_LABELS: Final[dict[str, str]] = {
+    RELINK_STATUS_MATCHED: "已匹配",
+    RELINK_STATUS_AMBIGUOUS: "同名文件有多个",
+    RELINK_STATUS_NOT_FOUND: "未找到",
+}
 
 
 # --------------------------------------------------------------------------

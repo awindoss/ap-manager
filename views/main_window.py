@@ -7,28 +7,45 @@
 # AppController -> LibraryService (plan.md §27).
 # ==============================================================================
 import sqlite3
+import time
+from pathlib import Path
 from typing import List, Optional, Sequence
 
-from PySide6.QtCore import QModelIndex, QPoint, Qt
-from PySide6.QtGui import QAction, QCloseEvent, QCursor, QKeySequence
+from PySide6.QtCore import QEvent, QModelIndex, QPoint, QRect, Qt, QTimer
+from PySide6.QtGui import QAction, QCloseEvent, QCursor, QGuiApplication, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
+    QDockWidget,
+    QFileDialog,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMenu,
     QMessageBox,
+    QSizePolicy,
+    QToolBar,
 )
 
 from controllers.app_controller import AppController, AttachResult, MoveOutcome
+from services.exporter import ExportResult
+from services.importer import ImportResult
 from services.pdf_launcher import LaunchReport, PdfLaunchError
+from services.search import SearchResult
 from utils.constants import (
     APP_NAME,
     APP_VERSION,
     DEFAULT_WINDOW_HEIGHT,
     DEFAULT_WINDOW_WIDTH,
+    IMPORT_MODE_MERGE,
+    IMPORT_MODE_REPLACE,
+    LIBRARY_FILE_FILTER,
+    LIBRARY_JSON_FILE_NAME,
+    SEARCH_DEBOUNCE_MS,
 )
-from utils.logger import log_error, log_info
+from utils.error_messages import describe_error
+from utils.logger import log_exception, log_info
+from utils.settings_manager import SettingsManager
 from views.delegates.tree_delegate import TreeDelegate
 from views.dialogs.add_node_dialog import AddNodeDialog
 from views.dialogs.choose_parent_dialog import ChooseParentDialog
@@ -37,8 +54,10 @@ from views.dialogs.node_positions_dialog import NodePositionsDialog
 from views.dialogs.node_properties_dialog import NodePropertiesDialog
 from views.dialogs.pdf_management_dialog import PdfManagementDialog
 from views.dialogs.pdf_selector_dialog import PdfSelectorDialog
+from views.dialogs.search_dialog import SearchDialog
 from views.dialogs.settings_dialog import SettingsDialog
 from views.library_tree_view import LibraryTreeView
+from views.search_panel import SearchResultsPanel
 from views.tree_model import DisplayPath, TreeItem, TreeModel
 
 
@@ -54,17 +73,35 @@ class MainWindow(QMainWindow):
         self,
         controller: Optional[AppController] = None,
         parent: Optional[QMainWindow] = None,
+        *,
+        settings_manager: Optional[SettingsManager] = None,
     ) -> None:
         super().__init__(parent)
         self.controller: AppController = controller or AppController()
         self.model = TreeModel(self.controller.library, self)
         self.tree_delegate = TreeDelegate(self)
+        # Session persistence (window rectangle, expanded branches, dock state).
+        # Reusing the controller's ConfigManager keeps every setting in the one
+        # config.json the rest of the application already reads (plan.md §33).
+        self.settings: SettingsManager = settings_manager or SettingsManager(
+            self.controller.config
+        )
 
         self._selection_actions: List[QAction] = []
+        self._last_search_result: Optional[SearchResult] = None
+
+        # Search is synchronous; a short debounce keeps typing responsive and
+        # avoids a database round-trip per keystroke (stage.md 7.2).
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(SEARCH_DEBOUNCE_MS)
+        self._search_timer.timeout.connect(self.run_search)
 
         self._build_ui()
+        self._build_search_ui()
         self._build_menus()
         self.refresh()
+        self._restore_window_state()
 
     # --------------------------------------------------------------------------
     # Construction
@@ -105,6 +142,54 @@ class MainWindow(QMainWindow):
         self._status_label = QLabel("", self)
         self.statusBar().addPermanentWidget(self._status_label)
 
+    def _build_search_ui(self) -> None:
+        """Create the top search box and the result dock (stage.md 7.2)."""
+        self.search_toolbar = QToolBar("搜索", self)
+        self.search_toolbar.setObjectName("searchToolBar")
+        self.search_toolbar.setMovable(False)
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, self.search_toolbar)
+
+        self.search_label = QLabel("🔎 搜索  ", self)
+        self.search_toolbar.addWidget(self.search_label)
+
+        self.search_box = QLineEdit(self)
+        self.search_box.setObjectName("searchBox")
+        self.search_box.setPlaceholderText("搜索节点名称或 PDF 文件名…")
+        self.search_box.setClearButtonEnabled(True)
+        self.search_box.setMinimumWidth(260)
+        self.search_box.setMaximumWidth(560)
+        self.search_box.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        self.search_box.setToolTip(
+            "输入关键词即时搜索；多个关键词用空格分隔（同时满足）。\n"
+            "Esc 清空，Ctrl+F 聚焦搜索框。"
+        )
+        self.search_box.textChanged.connect(self._on_search_text_changed)
+        self.search_box.returnPressed.connect(self.run_search)
+        self.search_box.installEventFilter(self)
+        self.search_toolbar.addWidget(self.search_box)
+
+        self.search_count_label = QLabel("", self)
+        self.search_count_label.setObjectName("searchCountLabel")
+        self.search_toolbar.addWidget(self.search_count_label)
+
+        self.search_dock = QDockWidget("搜索结果", self)
+        self.search_dock.setObjectName("searchDock")
+        self.search_dock.setAllowedAreas(
+            Qt.DockWidgetArea.LeftDockWidgetArea
+            | Qt.DockWidgetArea.RightDockWidgetArea
+        )
+        self.search_panel = SearchResultsPanel(self.search_dock)
+        self.search_panel.setObjectName("searchPanel")
+        self.search_panel.locationActivated.connect(self._on_search_location_activated)
+        self.search_panel.nodeActivated.connect(self._on_search_node_activated)
+        self.search_dock.setWidget(self.search_panel)
+        self.search_dock.setMinimumWidth(400)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.search_dock)
+        self.resizeDocks([self.search_dock], [440], Qt.Orientation.Horizontal)
+        self.search_dock.hide()
+
     def _build_menus(self) -> None:
         file_menu = self.menuBar().addMenu("文件(&F)")
 
@@ -119,6 +204,22 @@ class MainWindow(QMainWindow):
         self._new_child_action.setStatusTip("在当前选中的节点下创建子节点")
         self._new_child_action.triggered.connect(self._create_child_from_selection)
         file_menu.addAction(self._new_child_action)
+
+        file_menu.addSeparator()
+
+        # Phase 6: whole-library exchange. The actions themselves only pick the
+        # file/directory; the controller and services do the work.
+        self._import_action = QAction("导入图书馆(&I)…", self)
+        self._import_action.setShortcut(QKeySequence("Ctrl+I"))
+        self._import_action.setStatusTip("从 library.json 导入图书馆（可追加或替换当前书库）")
+        self._import_action.triggered.connect(self._import_library)
+        file_menu.addAction(self._import_action)
+
+        self._export_action = QAction("导出图书馆(&E)…", self)
+        self._export_action.setShortcut(QKeySequence("Ctrl+E"))
+        self._export_action.setStatusTip("把整个书库导出为可迁移的 library.json")
+        self._export_action.triggered.connect(self._export_library)
+        file_menu.addAction(self._export_action)
 
         file_menu.addSeparator()
 
@@ -214,6 +315,20 @@ class MainWindow(QMainWindow):
 
         view_menu.addSeparator()
 
+        search_action = QAction("搜索(&S)…", self)
+        search_action.setShortcut(QKeySequence("Ctrl+F"))
+        search_action.setStatusTip("聚焦搜索框，按节点名称或 PDF 文件名查找")
+        search_action.triggered.connect(self._focus_search)
+        view_menu.addAction(search_action)
+
+        search_dialog_action = QAction("在搜索对话框中查找(&D)…", self)
+        search_dialog_action.setShortcut(QKeySequence("Ctrl+Shift+F"))
+        search_dialog_action.setStatusTip("打开独立搜索窗口，点击结果直接定位")
+        search_dialog_action.triggered.connect(self._open_search_dialog)
+        view_menu.addAction(search_dialog_action)
+
+        view_menu.addSeparator()
+
         expand_action = QAction("展开全部(&E)", self)
         expand_action.triggered.connect(self.tree_view.expandAll)
         view_menu.addAction(expand_action)
@@ -230,7 +345,9 @@ class MainWindow(QMainWindow):
         tools_menu.addAction(self._inspect_action)
 
         self._relink_missing_action = QAction("重新定位缺失 PDF(&L)…", self)
-        self._relink_missing_action.setStatusTip("列出所有找不到的 PDF 并逐个重新定位")
+        self._relink_missing_action.setStatusTip(
+            "列出所有找不到的 PDF，可逐个或按文件夹批量重新定位"
+        )
         self._relink_missing_action.triggered.connect(self._relink_missing_pdfs)
         tools_menu.addAction(self._relink_missing_action)
 
@@ -242,6 +359,108 @@ class MainWindow(QMainWindow):
         settings_menu.addAction(self._pdf_reader_action)
 
         self._update_action_states()
+
+    # --------------------------------------------------------------------------
+    # Search (Phase 7)
+    # --------------------------------------------------------------------------
+    def _on_search_text_changed(self, text: str) -> None:
+        if not text.strip():
+            self._search_timer.stop()
+            self._last_search_result = None
+            self.search_count_label.setText("")
+            self.search_panel.clear()
+            self.search_dock.hide()
+            return
+        # Debounce: typing "马克思" must not run five SQL queries.
+        self._search_timer.start()
+
+    def run_search(self) -> Optional[SearchResult]:
+        """
+        Run the current query and show the result dock.
+
+        Public (no leading underscore) because the debounce timer, Enter key and
+        tests all use the same entry point.
+        """
+        self._search_timer.stop()
+        query = self.search_box.text().strip()
+        if not query:
+            self._on_search_text_changed("")
+            return None
+
+        started = time.perf_counter()
+        try:
+            result = self.controller.search_library(query)
+        except Exception as error:  # defensive: search must never crash the window
+            log_exception(f"Search failed for query {query!r}", error)
+            QMessageBox.warning(self, "无法搜索", describe_error(error))
+            return None
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+
+        self._last_search_result = result
+        self.search_panel.show_result(result, elapsed_ms=elapsed_ms)
+        self.search_dock.show()
+        self.search_dock.raise_()
+
+        if result.hit_count:
+            self.search_count_label.setText(f"{result.hit_count} 个节点")
+        else:
+            self.search_count_label.setText("无结果")
+
+        if result.is_empty:
+            message = f"没有找到与「{query}」匹配的节点。"
+        else:
+            message = (
+                f"搜索「{query}」：{result.hit_count} 个节点，"
+                f"{result.location_count} 个位置。"
+            )
+            if result.truncated:
+                message += f" 只显示前 {result.limit} 个节点，请缩小关键词。"
+        self.statusBar().showMessage(message, 6000)
+        return result
+
+    def _on_search_location_activated(self, path: Sequence[int]) -> None:
+        if self._reveal_display_path(path):
+            self.statusBar().showMessage("已定位到搜索结果的位置。", 4000)
+
+    def _on_search_node_activated(self, node_id: int) -> None:
+        self._reveal_node(node_id)
+        self.statusBar().showMessage("已定位到搜索结果中的节点。", 4000)
+
+    def _focus_search(self) -> None:
+        self.search_dock.show()
+        self.search_box.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        self.search_box.selectAll()
+        # Re-run an existing query so a dock that was closed/reopened or a tree
+        # that changed in the meantime never shows stale results.
+        if self.search_box.text().strip():
+            self.run_search()
+
+    def _clear_search(self) -> None:
+        self.search_box.clear()
+        self.tree_view.setFocus()
+
+    def _open_search_dialog(self) -> None:
+        """Open the dedicated search window and navigate to the chosen result."""
+        dialog = SearchDialog(self.controller, self)
+        current_query = self.search_box.text().strip()
+        if current_query:
+            dialog.set_query(current_query)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        if dialog.selected_path:
+            self._reveal_display_path(dialog.selected_path)
+        elif dialog.selected_node_id is not None:
+            self._reveal_node(dialog.selected_node_id)
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802 - Qt naming
+        if (
+            watched is self.search_box
+            and event.type() == QEvent.Type.KeyPress
+            and event.key() == Qt.Key.Key_Escape
+        ):
+            self._clear_search()
+            return True
+        return super().eventFilter(watched, event)
 
     # --------------------------------------------------------------------------
     # Model synchronisation
@@ -268,6 +487,11 @@ class MainWindow(QMainWindow):
             f"{self.model.displayed_item_count} display item(s), "
             f"{len(expanded_paths)} expanded path(s) restored."
         )
+
+        # Renaming/importing/moving a node can change what the current query
+        # matches; keep an open result dock in sync with the rebuilt model.
+        if self.search_box.text().strip() and self.search_dock.isVisible():
+            self.run_search()
 
     def _collect_expanded_paths(self) -> List[DisplayPath]:
         """Every expanded display instance, identified by its node-id path."""
@@ -347,6 +571,90 @@ class MainWindow(QMainWindow):
         if self.model.is_truncated:
             parts.append("结果已截断")
         self._status_label.setText(" | ".join(parts))
+
+    # --------------------------------------------------------------------------
+    # Window / view state persistence (Phase 7)
+    # --------------------------------------------------------------------------
+    def _restore_window_state(self) -> None:
+        """Apply the saved rectangle, expansion and search-dock visibility."""
+        geometry = self.settings.load_window_geometry()
+        if geometry is not None:
+            if geometry.has_position:
+                self._apply_saved_geometry(geometry)
+            else:
+                self.resize(geometry.width, geometry.height)
+            if geometry.maximized:
+                self.setWindowState(
+                    self.windowState() | Qt.WindowState.WindowMaximized
+                )
+
+        expanded_paths = self.settings.load_expanded_paths()
+        if expanded_paths:
+            self._restore_saved_expansion(expanded_paths)
+            log_info(
+                f"Restored {len(expanded_paths)} expanded branch(es) from config."
+            )
+
+        if self.settings.load_search_panel_visible():
+            self.search_dock.show()
+
+    def _apply_saved_geometry(self, geometry) -> None:
+        """
+        Restore a rectangle, moving it back on-screen if the display changed.
+
+        The size is kept as saved (a window may legitimately be larger than the
+        current screen); only an entirely off-screen position is re-centred so
+        the title bar never becomes unreachable.
+        """
+        rect = QRect(geometry.x or 0, geometry.y or 0, geometry.width, geometry.height)
+        screens = QGuiApplication.screens()
+        if not screens:
+            self.setGeometry(rect)
+            return
+
+        minimum_visible = 64
+        visible = any(
+            rect.intersected(screen.availableGeometry()).width() >= minimum_visible
+            and rect.intersected(screen.availableGeometry()).height() >= minimum_visible
+            for screen in screens
+        )
+        if visible:
+            self.setGeometry(rect)
+            return
+
+        primary = QGuiApplication.primaryScreen() or screens[0]
+        available = primary.availableGeometry()
+        centered_x = available.x() + max(0, (available.width() - rect.width()) // 2)
+        centered_y = available.y() + max(0, (available.height() - rect.height()) // 2)
+        self.setGeometry(
+            QRect(centered_x, centered_y, rect.width(), rect.height())
+        )
+        log_info("Saved window position was off-screen; centred on the primary screen.")
+
+    def _restore_saved_expansion(self, paths: Sequence[DisplayPath]) -> None:
+        """Expand saved display paths, parents first (already sorted by length)."""
+        for path in sorted(paths, key=len):
+            index = self.model.find_index_by_display_path(path)
+            if index.isValid() and not self.tree_view.isExpanded(index):
+                self.tree_view.expand(index)
+
+    def save_state(self) -> None:
+        """Persist geometry, expanded branches and the search dock state."""
+        try:
+            if self.isMaximized() or self.isFullScreen():
+                geometry = self.normalGeometry()
+            else:
+                geometry = self.geometry()
+            if not geometry.isValid():
+                geometry = self.rect()
+            self.settings.save_state(
+                geometry,
+                maximized=self.isMaximized(),
+                expanded_paths=self._collect_expanded_paths(),
+                search_panel_visible=self.search_dock.isVisible(),
+            )
+        except Exception as error:  # never block application exit
+            log_exception("Could not save the window state", error)
 
     # --------------------------------------------------------------------------
     # Selection / reveal helpers
@@ -468,8 +776,8 @@ class MainWindow(QMainWindow):
                 style_color=values["style_color"],
             )
         except (ValueError, sqlite3.Error) as error:
-            log_error(f"Could not create node: {error}")
-            QMessageBox.critical(self, "无法创建节点", str(error))
+            log_exception("Could not create node", error)
+            QMessageBox.critical(self, "无法创建节点", describe_error(error))
             return
 
         if new_id is None:
@@ -513,8 +821,8 @@ class MainWindow(QMainWindow):
         try:
             self.controller.update_node(node_id, **changes)
         except (ValueError, sqlite3.Error) as error:
-            log_error(f"Could not update node {node_id}: {error}")
-            QMessageBox.critical(self, "无法保存节点", str(error))
+            log_exception(f"Could not update node {node_id}", error)
+            QMessageBox.critical(self, "无法保存节点", describe_error(error))
             return
 
         # In-place update: no model reset, so expansion and selection survive.
@@ -560,8 +868,8 @@ class MainWindow(QMainWindow):
                 select_path=select_path,
             )
         except ValueError as error:
-            log_error(f"Could not open the PDF manager for node {node_id}: {error}")
-            QMessageBox.warning(self, "无法管理 PDF", str(error))
+            log_exception(f"Could not open the PDF manager for node {node_id}", error)
+            QMessageBox.warning(self, "无法管理 PDF", describe_error(error))
             self.refresh()
             return
 
@@ -614,8 +922,8 @@ class MainWindow(QMainWindow):
         try:
             self.controller.open_pdf(stored_path)
         except PdfLaunchError as error:
-            log_error(f"Could not open PDF {stored_path!r}: {error}")
-            QMessageBox.critical(self, "无法打开 PDF", str(error))
+            log_exception(f"Could not open PDF {stored_path!r}", error)
+            QMessageBox.critical(self, "无法打开 PDF", describe_error(error))
             return
         self.statusBar().showMessage(f"已打开 PDF：{stored_path}", 4000)
 
@@ -623,7 +931,7 @@ class MainWindow(QMainWindow):
         try:
             report = self.controller.open_node_pdfs(node_id)
         except ValueError as error:
-            QMessageBox.warning(self, "无法打开 PDF", str(error))
+            QMessageBox.warning(self, "无法打开 PDF", describe_error(error))
             return
         self._report_launch(report)
 
@@ -704,7 +1012,7 @@ class MainWindow(QMainWindow):
         try:
             positions = self.controller.get_node_positions(node_id)
         except ValueError as error:
-            QMessageBox.warning(self, "无法查看位置", str(error))
+            QMessageBox.warning(self, "无法查看位置", describe_error(error))
             return
 
         dialog = NodePositionsDialog(
@@ -755,8 +1063,8 @@ class MainWindow(QMainWindow):
         try:
             result = self.controller.attach_node_to_parents(node_id, list(parent_ids))
         except (ValueError, sqlite3.Error) as error:
-            log_error(f"Could not attach node {node_id}: {error}")
-            QMessageBox.warning(self, "无法关联", str(error))
+            log_exception(f"Could not attach node {node_id}", error)
+            QMessageBox.warning(self, "无法关联", describe_error(error))
             return
         self._apply_attach_result(result)
 
@@ -764,8 +1072,8 @@ class MainWindow(QMainWindow):
         try:
             result = self.controller.attach_nodes_to_parent(list(node_ids), parent_id)
         except (ValueError, sqlite3.Error) as error:
-            log_error(f"Could not attach nodes to parent {parent_id}: {error}")
-            QMessageBox.warning(self, "无法关联", str(error))
+            log_exception(f"Could not attach nodes to parent {parent_id}", error)
+            QMessageBox.warning(self, "无法关联", describe_error(error))
             return
         self._apply_attach_result(result)
 
@@ -863,8 +1171,8 @@ class MainWindow(QMainWindow):
                 old_parent_id, node_id, target_parent_id
             )
         except (ValueError, sqlite3.Error) as error:
-            log_error(f"Could not move node {node_id}: {error}")
-            QMessageBox.warning(self, "无法移动", str(error))
+            log_exception(f"Could not move node {node_id}", error)
+            QMessageBox.warning(self, "无法移动", describe_error(error))
             return
 
         self.refresh()
@@ -933,8 +1241,8 @@ class MainWindow(QMainWindow):
         try:
             removed = self.controller.detach_node(parent_id, node_id)
         except (ValueError, sqlite3.Error) as error:
-            log_error(f"Could not detach node {node_id} from {parent_id}: {error}")
-            QMessageBox.warning(self, "无法移除位置", str(error))
+            log_exception(f"Could not detach node {node_id} from {parent_id}", error)
+            QMessageBox.warning(self, "无法移除位置", describe_error(error))
             return
 
         if not removed:
@@ -1004,8 +1312,8 @@ class MainWindow(QMainWindow):
         try:
             self.controller.delete_node_completely(node_id)
         except (ValueError, sqlite3.Error) as error:
-            log_error(f"Could not delete node {node_id}: {error}")
-            QMessageBox.warning(self, "无法删除节点", str(error))
+            log_exception(f"Could not delete node {node_id}", error)
+            QMessageBox.warning(self, "无法删除节点", describe_error(error))
             return
 
         self.refresh()
@@ -1103,8 +1411,8 @@ class MainWindow(QMainWindow):
                 parent_id, source[-1], target[-1], before=before
             )
         except (ValueError, sqlite3.Error) as error:
-            log_error(f"Could not reorder nodes below {parent_id}: {error}")
-            QMessageBox.warning(self, "无法调整顺序", str(error))
+            log_exception(f"Could not reorder nodes below {parent_id}", error)
+            QMessageBox.warning(self, "无法调整顺序", describe_error(error))
             return
 
         self.refresh()
@@ -1112,6 +1420,217 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             "已调整节点顺序。" if changed else "顺序没有变化。", 4000
         )
+
+    # --------------------------------------------------------------------------
+    # Library import / export (Phase 6)
+    # --------------------------------------------------------------------------
+    def _import_library(self) -> None:
+        file_name, _ = QFileDialog.getOpenFileName(
+            self, "导入图书馆", "", LIBRARY_FILE_FILTER
+        )
+        if not file_name:
+            return
+        self._import_library_from(file_name)
+
+    def _prompt_import_mode(self) -> Optional[str]:
+        """
+        Ask whether an import appends to or replaces the current library.
+
+        An empty library needs no question. Replacing is a destructive operation
+        (classification only), so it asks for a second confirmation.
+        """
+        node_count, _edge_count = self.controller.get_library_counts()
+        if node_count == 0:
+            return IMPORT_MODE_MERGE
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("导入图书馆")
+        box.setText(f"当前书库已有 {node_count} 个节点。请选择导入方式：")
+        box.setInformativeText(
+            "追加导入：保留当前书库，把导入内容添加进来。\n"
+            "替换书库：清空当前分类（磁盘上的 PDF 不会被删除），"
+            "只保留导入内容。"
+        )
+        append_button = box.addButton(
+            "追加导入", QMessageBox.ButtonRole.AcceptRole
+        )
+        replace_button = box.addButton(
+            "替换当前书库", QMessageBox.ButtonRole.DestructiveRole
+        )
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(append_button)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked is append_button:
+            return IMPORT_MODE_MERGE
+        if clicked is replace_button and self._confirm_replace_library():
+            return IMPORT_MODE_REPLACE
+        return None
+
+    def _confirm_replace_library(self) -> bool:
+        node_count, edge_count = self.controller.get_library_counts()
+        answer = QMessageBox.question(
+            self,
+            "替换当前书库",
+            f"确定要用导入的图书馆替换当前书库吗？\n\n"
+            f"当前 {node_count} 个节点、{edge_count} 条分类关系将被删除。\n"
+            "磁盘上的 PDF 文件不会被删除。\n"
+            "此操作不可撤销。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _import_library_from(
+        self,
+        json_path: object,
+        mode: Optional[str] = None,
+    ) -> Optional[ImportResult]:
+        """
+        Import ``json_path`` and refresh the view.
+
+        Returns the :class:`ImportResult` on success and ``None`` when the user
+        cancels or the import fails. The database is untouched on failure
+        (the importer runs in a single transaction).
+        """
+        if mode is None:
+            mode = self._prompt_import_mode()
+            if mode is None:
+                return None
+
+        try:
+            result = self.controller.import_library(json_path, mode=mode)
+        except (ValueError, OSError, sqlite3.Error) as error:
+            log_exception(f"Could not import library {json_path!r}", error)
+            QMessageBox.critical(
+                self,
+                "导入失败",
+                f"{describe_error(error)}\n\n当前书库没有被修改。",
+            )
+            return None
+
+        self.refresh()
+        self._show_import_result(result)
+        return result
+
+    def _show_import_result(self, result: ImportResult) -> None:
+        action = "替换" if result.mode == IMPORT_MODE_REPLACE else "追加"
+        summary = (
+            f"已{action}导入 {result.node_count} 个节点、"
+            f"{result.edge_count} 条分类关系。"
+        )
+        if result.missing_pdfs:
+            summary += (
+                f"\n其中 {len(result.missing_pdfs)} 个 PDF 文件当前找不到，"
+                "可稍后用「重新定位缺失 PDF」修复。"
+            )
+        self.statusBar().showMessage(summary.replace("\n", " "), 8000)
+
+        if result.warnings:
+            details = "\n".join(f"• {warning}" for warning in result.warnings[:8])
+            if len(result.warnings) > 8:
+                details += "\n…"
+            QMessageBox.warning(
+                self,
+                "导入完成（有警告）",
+                f"{summary}\n\n{details}",
+            )
+        else:
+            QMessageBox.information(self, "导入完成", summary)
+
+    def _export_library(self) -> None:
+        directory = QFileDialog.getExistingDirectory(self, "选择导出目录")
+        if not directory:
+            return
+        self._export_library_to(directory)
+
+    def _export_library_to(
+        self,
+        directory: object,
+        *,
+        copy_pdfs: Optional[bool] = None,
+        overwrite: Optional[bool] = None,
+    ) -> Optional[ExportResult]:
+        """
+        Export into ``directory`` and report the outcome.
+
+        ``copy_pdfs`` / ``overwrite`` are asked interactively when omitted, so
+        tests and scripted callers can pass explicit values and skip the dialogs.
+        """
+        raw = "" if directory is None else str(directory).strip()
+        if not raw:
+            return None
+        export_dir = Path(raw).expanduser()
+        json_path = export_dir / LIBRARY_JSON_FILE_NAME
+
+        if overwrite is None:
+            overwrite = True
+            if json_path.exists():
+                answer = QMessageBox.question(
+                    self,
+                    "覆盖导出文件",
+                    f"导出目录中已经存在 {LIBRARY_JSON_FILE_NAME}：\n"
+                    f"{json_path}\n\n是否覆盖它？",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    return None
+
+        if copy_pdfs is None:
+            answer = QMessageBox.question(
+                self,
+                "导出 PDF 文件",
+                "是否把 PDF 文件一起复制到导出目录的 books/ 中？\n\n"
+                "是：导出目录可以直接复制到其他电脑。\n"
+                "否：只导出分类结构和路径引用。",
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No
+                | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Yes,
+            )
+            if answer == QMessageBox.StandardButton.Cancel:
+                return None
+            copy_pdfs = answer == QMessageBox.StandardButton.Yes
+
+        try:
+            result = self.controller.export_library(
+                export_dir,
+                copy_pdfs=bool(copy_pdfs),
+                overwrite=bool(overwrite),
+            )
+        except (ValueError, OSError, sqlite3.Error) as error:
+            log_exception(f"Could not export library to {export_dir}", error)
+            QMessageBox.critical(self, "导出失败", describe_error(error))
+            return None
+
+        self._show_export_result(result)
+        return result
+
+    def _show_export_result(self, result: ExportResult) -> None:
+        summary = (
+            f"已导出 {result.node_count} 个节点、"
+            f"{result.edge_count} 条分类关系到：\n{result.json_path}"
+        )
+        if result.pdf_copies:
+            summary += f"\n已复制 {result.pdf_copies} 个 PDF 到 books/。"
+        if result.icon_copies:
+            summary += f"\n已复制 {result.icon_copies} 个图标到 icons/。"
+        self.statusBar().showMessage(f"已导出图书馆：{result.json_path}", 8000)
+
+        if result.warnings:
+            details = "\n".join(f"• {warning}" for warning in result.warnings[:8])
+            if len(result.warnings) > 8:
+                details += "\n…"
+            QMessageBox.warning(
+                self,
+                "导出完成（有警告）",
+                f"{summary}\n\n{details}",
+            )
+        else:
+            QMessageBox.information(self, "导出完成", summary)
 
     # --------------------------------------------------------------------------
     # File checks / settings
@@ -1166,8 +1685,8 @@ class MainWindow(QMainWindow):
         try:
             reader_path = self.controller.set_pdf_reader_path(dialog.reader_path())
         except (ValueError, OSError) as error:
-            log_error(f"Could not save the PDF reader setting: {error}")
-            QMessageBox.critical(self, "无法保存设置", str(error))
+            log_exception("Could not save the PDF reader setting", error)
+            QMessageBox.critical(self, "无法保存设置", describe_error(error))
             return
 
         label = reader_path or "系统默认阅读器"
@@ -1312,6 +1831,8 @@ class MainWindow(QMainWindow):
     # Qt events
     # --------------------------------------------------------------------------
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt naming
+        self._search_timer.stop()
+        self.save_state()
         self.controller.shutdown()
         super().closeEvent(event)
 

@@ -260,6 +260,39 @@ class LibraryService:
         """
         return self.db.get_all_nodes()
 
+    def search_nodes(self, tokens: Iterable[str], limit: int = 100) -> List[Node]:
+        """
+        SQL-backed candidate lookup for the search feature (Phase 7).
+
+        Tokens are ANDed and matched against node names and PDF references;
+        ``services.search`` adds match classification and location paths.
+        """
+        return self.db.search_nodes(list(tokens), limit=limit)
+
+    def get_all_edges(self) -> List[Edge]:
+        """Every edge in the library, ordered by edge id (used by export)."""
+        return self.db.get_all_edges()
+
+    def insert_graph(
+        self,
+        nodes: List[Node],
+        edges: List[tuple[int, int, int]],
+        *,
+        replace: bool = False,
+    ) -> List[int]:
+        """
+        Store a validated graph in one transaction (Phase 6 import).
+
+        ``edges`` reference indices in ``nodes``; see
+        :meth:`Database.insert_graph`. Returning the new ids lets the importer
+        rebuild its ``external_id -> local_id`` map.
+        """
+        return self.db.insert_graph(nodes, edges, replace=replace)
+
+    def clear_library(self) -> None:
+        """Remove every node and edge without touching any file on disk."""
+        self.db.clear_all()
+
     def get_parent_count_map(self) -> Dict[int, int]:
         """
         Return ``{node_id: parent_count}`` for the whole library in one query.

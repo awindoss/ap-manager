@@ -162,6 +162,13 @@ def import_custom_icon(
     digest = hashlib.sha256(source.read_bytes()).hexdigest()[:8]
     stem = _SAFE_STEM_PATTERN.sub("_", source.stem)
     stem = re.sub(r"_+", "_", stem).strip("._")[:_MAX_STEM_LENGTH] or "icon"
+    # The file may already be a content-addressed export (``star_1a2b3c4d.png``).
+    # In that case keep the existing name instead of appending the digest again,
+    # so exporting and re-importing an icon is stable rather than growing the
+    # file name on every migration.
+    digest_suffix = f"_{digest}"
+    if stem.endswith(digest_suffix) and len(stem) > len(digest_suffix):
+        stem = stem[: -len(digest_suffix)] or "icon"
     destination = icons_root / f"{stem}_{digest}{extension}"
 
     if not destination.exists():

@@ -15,10 +15,14 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from models.library import GraphCycleError, LibraryService
 from models.node import Node, normalize_color, normalize_icon
 from services import path_manager
+from services.exporter import ExportResult, export_library as export_library_file
+from services.importer import ImportResult, import_library as import_library_file
 from services.pdf_launcher import LaunchReport, PdfLaunchError, PdfLauncher
+from services.relocator import RelinkPlan, RelinkRequest, plan_batch_relink
+from services.search import SearchResult, SearchService
 from utils import constants
 from utils.config_manager import ConfigManager
-from utils.logger import log_error, log_info, log_warning
+from utils.logger import log_debug, log_error, log_info, log_warning
 
 
 @dataclass(frozen=True)
@@ -63,6 +67,30 @@ class PdfInspection:
     @property
     def existing_count(self) -> int:
         return self.total_pdfs - len(self.missing)
+
+
+@dataclass(frozen=True)
+class BatchRelinkOutcome:
+    """Result of matching missing PDFs against a user-picked folder."""
+
+    search_root: Path
+    requested: int
+    relinked: int
+    ambiguous: List[MissingPdf] = field(default_factory=list)
+    not_found: List[MissingPdf] = field(default_factory=list)
+    errors: List[Tuple[MissingPdf, str]] = field(default_factory=list)
+
+    @property
+    def has_changes(self) -> bool:
+        return self.relinked > 0
+
+    @property
+    def unmatched_count(self) -> int:
+        return len(self.ambiguous) + len(self.not_found)
+
+    @property
+    def failed_count(self) -> int:
+        return len(self.errors)
 
 
 @dataclass(frozen=True)
@@ -144,6 +172,10 @@ class AppController:
             if db_path is None:
                 db_path = path_manager.normalize_path(self.config.get_library_db_path())
             self.library = LibraryService(db_path=db_path)
+
+        # Search is a read-only service over the same business layer; the UI
+        # never queries SQLite directly (plan.md §27).
+        self.search_service: SearchService = SearchService(self.library)
 
         # The launcher is injectable for tests; otherwise it reads the reader
         # configured in config.json (empty -> platform default).
@@ -574,8 +606,15 @@ class AppController:
                 if path_manager.pdf_path_key(path) == new_key:
                     raise ValueError("该文件已经关联到当前节点。")
 
-        self.library.relink_pdf(node_id, old, new_stored)
-        log_info(f"Node {node_id}: re-linked PDF reference {old!r} -> {new_stored!r}.")
+        changed = self.library.relink_pdf(node_id, old, new_stored)
+        if changed:
+            log_info(f"Node {node_id}: re-linked PDF reference {old!r} -> {new_stored!r}.")
+        else:
+            # Same file (e.g. only the spelling changed): nothing was written.
+            log_debug(
+                f"Node {node_id}: PDF reference {old!r} already resolved to "
+                f"{new_stored!r}; no change written."
+            )
         return new_stored
 
     def open_pdf(self, stored_path: object) -> bool:
@@ -651,6 +690,125 @@ class AppController:
         return self.inspect_pdfs().missing
 
     # --------------------------------------------------------------------------
+    # Search (Phase 7)
+    # --------------------------------------------------------------------------
+    def search_library(
+        self,
+        query: object,
+        *,
+        limit: Optional[int] = None,
+    ) -> SearchResult:
+        """
+        Search node names and PDF references.
+
+        Returns one hit per matching node with every root-to-node position, so
+        the UI can show all locations of a multi-parent node (plan.md §28).
+        """
+        result = self.search_service.search(query, limit=limit)
+        if result.query:
+            log_debug(
+                f"Search {result.query!r}: {result.hit_count} node(s), "
+                f"{result.location_count} location(s)"
+                + (" (truncated)." if result.truncated else ".")
+            )
+        return result
+
+    # --------------------------------------------------------------------------
+    # Batch relocation (Phase 7)
+    # --------------------------------------------------------------------------
+    def plan_missing_relocation(
+        self,
+        search_root: object,
+        *,
+        entries: Optional[List[MissingPdf]] = None,
+        recursive: bool = True,
+    ) -> RelinkPlan:
+        """
+        Preview which missing PDFs a folder can satisfy, without changing data.
+
+        ``entries`` defaults to every missing reference in the library, so the
+        dialog can batch-fix the whole collection or only the selected rows.
+        """
+        entries_list = list(entries) if entries is not None else self.find_missing_pdfs()
+        requests = [
+            RelinkRequest(node_id=entry.node_id, stored_path=entry.stored_path)
+            for entry in entries_list
+        ]
+        return plan_batch_relink(requests, search_root, recursive=recursive)
+
+    def relink_missing_from_folder(
+        self,
+        search_root: object,
+        *,
+        entries: Optional[List[MissingPdf]] = None,
+        recursive: bool = True,
+        copy_to_books: bool = False,
+    ) -> BatchRelinkOutcome:
+        """
+        Match missing PDFs by file name against a folder and re-link the matches.
+
+        Unmatched/ambiguous entries are reported instead of guessed, and a
+        failure on one file never aborts the remaining batch. Only database
+        references change; disk files are untouched (plan.md §40).
+        """
+        entries_list = list(entries) if entries is not None else self.find_missing_pdfs()
+        plan = self.plan_missing_relocation(
+            search_root,
+            entries=entries_list,
+            recursive=recursive,
+        )
+
+        relinked = 0
+        ambiguous: List[MissingPdf] = []
+        not_found: List[MissingPdf] = []
+        errors: List[Tuple[MissingPdf, str]] = []
+
+        for entry, decision in zip(entries_list, plan.decisions):
+            if not decision.matched:
+                if decision.status == constants.RELINK_STATUS_AMBIGUOUS:
+                    ambiguous.append(entry)
+                else:
+                    not_found.append(entry)
+                continue
+
+            try:
+                self.relink_pdf(
+                    entry.node_id,
+                    entry.stored_path,
+                    decision.new_path,
+                    copy_to_books=copy_to_books,
+                )
+            except (ValueError, OSError, sqlite3.Error) as error:
+                log_error(
+                    f"Batch relocation could not re-link {entry.stored_path!r} "
+                    f"for node {entry.node_id}: {error}"
+                )
+                errors.append((entry, str(error)))
+            except Exception as error:  # defensive: keep the batch moving
+                log_error(
+                    f"Unexpected batch relocation failure for {entry.stored_path!r}: {error}"
+                )
+                errors.append((entry, f"未预期的错误：{error}"))
+            else:
+                relinked += 1
+
+        outcome = BatchRelinkOutcome(
+            search_root=plan.search_root,
+            requested=len(entries_list),
+            relinked=relinked,
+            ambiguous=ambiguous,
+            not_found=not_found,
+            errors=errors,
+        )
+        log_info(
+            f"Batch relocation from {plan.search_root}: "
+            f"{relinked}/{len(entries_list)} re-linked, "
+            f"{len(ambiguous)} ambiguous, {len(not_found)} not found, "
+            f"{len(errors)} error(s)."
+        )
+        return outcome
+
+    # --------------------------------------------------------------------------
     # PDF reader settings
     # --------------------------------------------------------------------------
     def get_pdf_reader_path(self) -> str:
@@ -693,6 +851,73 @@ class AppController:
         self.launcher.set_reader_path(raw, self.config.get_pdf_reader_args())
         log_info(f"PDF reader set to: {raw or 'system default'}")
         return raw
+
+    # --------------------------------------------------------------------------
+    # Library import / export (Phase 6)
+    # --------------------------------------------------------------------------
+    def export_library(
+        self,
+        export_dir: object,
+        *,
+        copy_pdfs: bool = False,
+        overwrite: bool = True,
+    ) -> ExportResult:
+        """
+        Export the whole library to ``export_dir`` as ``library.json``.
+
+        The view only chooses the directory and the copy policy; the actual
+        document layout and path rebasing live in :mod:`services.exporter`.
+        """
+        raw = "" if export_dir is None else str(export_dir).strip()
+        if not raw:
+            raise ValueError("请选择导出目录。")
+        result = export_library_file(
+            self.library,
+            Path(raw).expanduser(),
+            copy_pdfs=bool(copy_pdfs),
+            overwrite=bool(overwrite),
+        )
+        log_info(
+            f"Library exported to {result.json_path}: "
+            f"{result.node_count} node(s), {result.edge_count} edge(s)."
+        )
+        return result
+
+    def import_library(
+        self,
+        json_path: object,
+        *,
+        mode: str = constants.IMPORT_MODE_MERGE,
+    ) -> ImportResult:
+        """
+        Import a ``library.json`` file into the current library.
+
+        ``mode`` is ``"merge"`` (append) or ``"replace"`` (clear first). The
+        whole import is one transaction; on any error the previous library is
+        preserved.
+        """
+        if mode not in constants.IMPORT_MODES:
+            raise ValueError(
+                f"未知的导入方式：{mode!r}（可用：{'、'.join(constants.IMPORT_MODES)}）。"
+            )
+        raw = "" if json_path is None else str(json_path).strip()
+        if not raw:
+            raise ValueError("请选择要导入的图书馆文件。")
+        result = import_library_file(
+            self.library,
+            Path(raw).expanduser(),
+            mode=mode,
+        )
+        log_info(
+            f"Library imported from {result.json_path}: "
+            f"{result.node_count} node(s), {result.edge_count} edge(s), "
+            f"mode {result.mode}."
+        )
+        return result
+
+    def get_library_counts(self) -> Tuple[int, int]:
+        """``(node_count, edge_count)`` for menus and import-mode prompts."""
+        return len(self.library.get_all_nodes()), len(self.library.get_all_edges())
 
     def _require_node(self, node_id: int) -> Node:
         node = self.library.get_node(node_id)

@@ -171,6 +171,18 @@ def test_import_custom_icon_copies_and_deduplicates(icons_env, tmp_path) -> None
     assert len(list(icons.glob("*.png"))) == 1
 
 
+def test_import_custom_icon_keeps_a_content_addressed_name(icons_env, tmp_path) -> None:
+    """Re-importing an exported icon must not append a second content hash."""
+    root, icons = icons_env
+    source = tmp_path / "book.png"
+    write_png(source)
+    first = icon_utils.import_custom_icon(source)
+    exported = root / first
+
+    assert icon_utils.import_custom_icon(exported) == first
+    assert len(list(icons.glob("*.png"))) == 1
+
+
 def test_import_custom_icon_preserves_extension_and_sanitises_stem(icons_env, tmp_path) -> None:
     root, icons = icons_env
     source = tmp_path / "weird name (copy).png"

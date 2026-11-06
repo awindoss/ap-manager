@@ -166,11 +166,11 @@ class Database:
         """
         cursor = conn.execute(sql, (
             node.name,
-            json.dumps(node.pdf_paths),
+            json.dumps(node.pdf_paths, ensure_ascii=False),
             node.icon,
             1 if node.style_bold else 0,
             node.style_color,
-            json.dumps(node.metadata)
+            json.dumps(node.metadata, ensure_ascii=False)
         ))
         new_id = cursor.lastrowid
         if new_id is None:
@@ -218,7 +218,7 @@ class Database:
                 db_column = valid_fields[key]
                 set_clauses.append(f"{db_column} = ?")
                 if key in ("pdf_paths", "metadata"):
-                    values.append(json.dumps(val))
+                    values.append(json.dumps(val, ensure_ascii=False))
                 elif key == "style_bold":
                     values.append(1 if val else 0)
                 elif key == "style_color":
@@ -642,6 +642,73 @@ class Database:
             log_error(f"Error retrieving all nodes: {e}")
             return []
 
+    def search_nodes(self, tokens: List[str], limit: int = 100) -> List[Node]:
+        """
+        Find nodes whose name or PDF references contain every search token.
+
+        The query runs in SQLite (one indexed-free scan, acceptable for the
+        local library sizes targeted by plan.md §37) and is deliberately
+        parameterised: ``%`` and ``_`` typed by the user are escaped so they
+        match literally rather than acting as LIKE wildcards.
+
+        Tokens are ANDed: ``"马克思 资本"`` must match both terms, each of them
+        either in the node name or in any stored PDF reference. The caller
+        (``services.search``) performs the final case-insensitive classification
+        and adds the location paths.
+        """
+        cleaned = [str(token).strip() for token in tokens or () if str(token).strip()]
+        if not cleaned or limit <= 0:
+            return []
+
+        conditions: List[str] = []
+        params: List[Any] = []
+        for token in cleaned:
+            pattern = f"%{self._escape_like(token)}%"
+            # ``pdf_paths`` is a JSON text column. Older databases were written
+            # with ``ensure_ascii=True``, so a non-ASCII path is stored as
+            # ``\u8d44\u672c`` and would not match the raw token. Matching both
+            # spellings keeps search working for old and new rows.
+            escaped_token = json.dumps(token, ensure_ascii=True)[1:-1]
+            if escaped_token != token:
+                escaped_pattern = f"%{self._escape_like(escaped_token)}%"
+                conditions.append(
+                    f"({constants.COLUMN_NODE_NAME} LIKE ? ESCAPE '\\' "
+                    f"OR {constants.COLUMN_NODE_PDFS} LIKE ? ESCAPE '\\' "
+                    f"OR {constants.COLUMN_NODE_PDFS} LIKE ? ESCAPE '\\')"
+                )
+                params.extend((pattern, pattern, escaped_pattern))
+            else:
+                conditions.append(
+                    f"({constants.COLUMN_NODE_NAME} LIKE ? ESCAPE '\\' "
+                    f"OR {constants.COLUMN_NODE_PDFS} LIKE ? ESCAPE '\\')"
+                )
+                params.extend((pattern, pattern))
+        params.append(int(limit))
+
+        sql = (
+            f"SELECT * FROM {constants.TABLE_NODES} "
+            f"WHERE {' AND '.join(conditions)} "
+            f"ORDER BY {constants.COLUMN_NODE_NAME} COLLATE NOCASE ASC, "
+            f"{constants.COLUMN_NODE_ID} ASC "
+            f"LIMIT ?"
+        )
+        try:
+            with self.connection() as conn:
+                rows = conn.execute(sql, params).fetchall()
+                return [self._row_to_node(row) for row in rows]
+        except sqlite3.Error as e:
+            log_error(f"Error searching nodes for {cleaned!r}: {e}")
+            return []
+
+    @staticmethod
+    def _escape_like(value: str) -> str:
+        """Escape LIKE metacharacters for an ``ESCAPE '\\'`` clause."""
+        return (
+            value.replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
+
     def get_all_edges(self) -> List[Edge]:
         """
         Retrieve all edges from the database and sort them in ascending order by ID.
@@ -655,3 +722,76 @@ class Database:
         except sqlite3.Error as e:
             log_error(f"Error retrieving all edges: {e}")
             return []
+
+    # --------------------------------------------------------------------------
+    # Bulk graph writes (Phase 6 import)
+    # --------------------------------------------------------------------------
+    def insert_graph(
+        self,
+        nodes: List[Node],
+        edges: List[tuple[int, int, int]],
+        *,
+        replace: bool = False,
+    ) -> List[int]:
+        """
+        Insert a whole graph in one transaction and return the new node ids.
+
+        ``edges`` are ``(parent_index, child_index, sort_order)`` triples that
+        index into ``nodes``, because external ids are only meaningful to the
+        importer. Everything is written on one connection, so an invalid triple
+        or a SQLite failure rolls the complete import back instead of leaving a
+        partial library behind (plan.md §38).
+
+        With ``replace=True`` the existing graph is cleared inside the same
+        transaction; the replacement therefore never leaves an empty database
+        behind if the new graph fails to insert.
+
+        Raises ``ValueError`` for an out-of-range edge index and ``sqlite3.Error``
+        for database failures; both propagate after the transaction rollback.
+        """
+        try:
+            with self.connection() as conn:
+                if replace:
+                    conn.execute(f"DELETE FROM {constants.TABLE_EDGES}")
+                    conn.execute(f"DELETE FROM {constants.TABLE_NODES}")
+
+                local_ids: List[int] = [
+                    self._insert_node_with_conn(conn, node) for node in nodes
+                ]
+
+                node_count = len(local_ids)
+                for parent_index, child_index, sort_order in edges:
+                    if not (0 <= parent_index < node_count):
+                        raise ValueError(
+                            f"Edge parent index {parent_index} is outside the imported node list."
+                        )
+                    if not (0 <= child_index < node_count):
+                        raise ValueError(
+                            f"Edge child index {child_index} is outside the imported node list."
+                        )
+                    self._insert_edge_with_conn(
+                        conn,
+                        local_ids[parent_index],
+                        local_ids[child_index],
+                        int(sort_order),
+                    )
+        except sqlite3.Error as e:
+            log_error(f"Error inserting imported graph: {e}")
+            raise
+
+        log_info(
+            f"Inserted graph with {len(local_ids)} node(s) and {len(edges)} edge(s)"
+            + (" (replacing the previous library)." if replace else ".")
+        )
+        return local_ids
+
+    def clear_all(self) -> None:
+        """Delete every node and edge, keeping the schema and file intact."""
+        try:
+            with self.connection() as conn:
+                conn.execute(f"DELETE FROM {constants.TABLE_EDGES}")
+                conn.execute(f"DELETE FROM {constants.TABLE_NODES}")
+        except sqlite3.Error as e:
+            log_error(f"Error clearing the library: {e}")
+            raise
+        log_info("Cleared all nodes and edges from the library database.")

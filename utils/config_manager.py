@@ -31,9 +31,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         constants.KEY_WINDOW_HEIGHT: constants.DEFAULT_WINDOW_HEIGHT,
         constants.KEY_WINDOW_X: None,
         constants.KEY_WINDOW_Y: None,
+        constants.KEY_WINDOW_MAXIMIZED: constants.DEFAULT_WINDOW_MAXIMIZED,
+        constants.KEY_EXPANDED_PATHS: [],
+        constants.KEY_SEARCH_PANEL_VISIBLE: False,
     },
     constants.SECTION_LIBRARY: {
         constants.KEY_DB_PATH: constants.DEFAULT_DB_PATH_RELATIVE,
+    },
+    constants.SECTION_LOGGING: {
+        constants.KEY_LOG_LEVEL: constants.DEFAULT_LOG_LEVEL_NAME,
     },
 }
 
@@ -193,12 +199,18 @@ def _merge_defaults(defaults: Dict[str, Any], loaded: Dict[str, Any]) -> Dict[st
         if isinstance(existing, dict) and isinstance(value, dict):
             existing.update(value)
         else:
-            if key in defaults and not isinstance(value, type(defaults[key])):
-                log_warning(
-                    f"Config key {key!r} has an unexpected type "
-                    f"({type(value).__name__}); keeping the default."
-                )
-                continue
+            if key in defaults:
+                default_value = defaults[key]
+                # ``None`` means "unset/auto", so any concrete JSON value is
+                # acceptable (e.g. a saved window_x integer).
+                if default_value is not None and not isinstance(
+                    value, type(default_value)
+                ):
+                    log_warning(
+                        f"Config key {key!r} has an unexpected type "
+                        f"({type(value).__name__}); keeping the default."
+                    )
+                    continue
             merged[key] = deepcopy(value)
     return merged
 

@@ -191,7 +191,10 @@ class PdfLauncher:
         Validate a configured reader without forbidding bare command names.
 
         A value such as ``sumatrapdf`` (no separators) is left to ``PATH`` lookup
-        by the OS. A value that looks like a filesystem path must exist.
+        by the OS, which keeps programmatic callers flexible; a value that looks
+        like a filesystem path must exist. The settings dialog is deliberately
+        stricter: ``AppController.set_pdf_reader_path`` only accepts an existing
+        file, so a typo surfaces there instead of failing at launch time.
         """
         candidate = Path(reader_path).expanduser()
         looks_like_path = (

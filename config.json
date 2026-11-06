@@ -8,10 +8,17 @@
         "window_width": 1200,
         "window_height": 800,
         "window_x": null,
-        "window_y": null
+        "window_y": null,
+        "window_maximized": false,
+        "expanded_paths": [],
+        "search_panel_visible": false
     },
 
     "library": {
         "database_path": "data/library.db"
+    },
+
+    "logging": {
+        "level": "INFO"
     }
 }

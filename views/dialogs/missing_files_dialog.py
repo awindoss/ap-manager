@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 )
 
 from utils import constants
+from utils.error_messages import describe_error
 from utils.logger import log_info
 
 if TYPE_CHECKING:  # pragma: no cover - type checking only
@@ -96,6 +97,14 @@ class MissingFilesDialog(QDialog):
         self.relink_button.clicked.connect(self.relink_selected)
         action_row.addWidget(self.relink_button)
 
+        self.batch_button = QPushButton("批量重新定位…", self)
+        self.batch_button.setObjectName("batchRelinkButton")
+        self.batch_button.setToolTip(
+            "选择一个文件夹，按文件名自动匹配并重新定位选中的（或全部）缺失 PDF"
+        )
+        self.batch_button.clicked.connect(self.batch_relink_selected)
+        action_row.addWidget(self.batch_button)
+
         self.reveal_button = QPushButton("定位节点", self)
         self.reveal_button.setObjectName("revealNodeButton")
         self.reveal_button.setToolTip("在主窗口中展开并管理该节点")
@@ -107,9 +116,16 @@ class MissingFilesDialog(QDialog):
         self.refresh_button.clicked.connect(self.reload)
         action_row.addWidget(self.refresh_button)
 
-        self.copy_check = QCheckBox("重新定位时复制到 books/ 目录", self)
+        self.copy_check = QCheckBox("复制到 books/ 目录", self)
         self.copy_check.setObjectName("copyRelocatedCheck")
+        self.copy_check.setToolTip("重新定位时把文件复制到应用的 books/ 目录")
         action_row.addWidget(self.copy_check)
+
+        self.recursive_check = QCheckBox("包含子文件夹", self)
+        self.recursive_check.setObjectName("recursiveRelinkCheck")
+        self.recursive_check.setChecked(True)
+        self.recursive_check.setToolTip("批量重新定位时在所选文件夹的子文件夹中查找")
+        action_row.addWidget(self.recursive_check)
         action_row.addStretch(1)
         layout.addLayout(action_row)
 
@@ -150,8 +166,9 @@ class MissingFilesDialog(QDialog):
         if self._entries:
             node_count = len({entry.node_id for entry in self._entries})
             self.header_label.setText(
-                f"共发现 {len(self._entries)} 个缺失 PDF，分布在 {node_count} 个节点中。"
-                "重新定位只更新路径，不会改变节点在分类中的位置。"
+                f"共发现 {len(self._entries)} 个缺失 PDF，分布在 {node_count} 个节点中。\n"
+                "可以逐条重新定位，也可以选择一个文件夹批量按文件名匹配；"
+                "两种方式都只更新路径，不会改变节点在分类中的位置。"
             )
         else:
             self.header_label.setText("没有发现缺失的 PDF 文件。")
@@ -172,6 +189,7 @@ class MissingFilesDialog(QDialog):
     def _update_button_states(self) -> None:
         selected = self.selected_entries()
         self.relink_button.setEnabled(len(selected) == 1)
+        self.batch_button.setEnabled(bool(self._entries))
         self.reveal_button.setEnabled(bool(selected))
 
     # --------------------------------------------------------------------------
@@ -206,12 +224,112 @@ class MissingFilesDialog(QDialog):
                 copy_to_books=self.copy_check.isChecked(),
             )
         except (ValueError, OSError, sqlite3.Error) as error:
-            QMessageBox.warning(self, "无法重新定位 PDF", str(error))
+            QMessageBox.warning(self, "无法重新定位 PDF", describe_error(error))
             return
 
         self.changed = True
         self.reload()
         self.status_label.setText(f"已更新「{entry.node_name}」的 PDF 位置：{stored}")
+
+    def batch_relink_selected(self) -> None:
+        """
+        Re-link several missing PDFs by scanning a folder for same-named files.
+
+        Selected rows are used when there is a selection; otherwise the whole
+        list is processed, which is the common case after moving a books folder.
+        """
+        entries = self.selected_entries() or list(self._entries)
+        if not entries:
+            self.status_label.setText("没有需要重新定位的 PDF。")
+            return
+
+        start_directory = ""
+        for entry in entries:
+            if entry.absolute_path is not None:
+                candidate = Path(entry.absolute_path).parent
+                if candidate.is_dir():
+                    start_directory = str(candidate)
+                    break
+
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "选择包含 PDF 的文件夹",
+            start_directory,
+        )
+        if not folder:
+            return
+
+        relink_missing = getattr(self._controller, "relink_missing_from_folder", None)
+        if not callable(relink_missing):
+            QMessageBox.warning(
+                self,
+                "无法批量重新定位",
+                "当前控制器不支持批量重新定位，请逐条重新定位。",
+            )
+            return
+
+        try:
+            outcome = relink_missing(
+                folder,
+                entries=entries,
+                recursive=self.recursive_check.isChecked(),
+                copy_to_books=self.copy_check.isChecked(),
+            )
+        except (ValueError, OSError, sqlite3.Error) as error:
+            QMessageBox.warning(
+                self,
+                "无法批量重新定位",
+                describe_error(error),
+            )
+            return
+
+        self.changed = self.changed or bool(getattr(outcome, "has_changes", False))
+        self.reload()
+        self._report_batch_outcome(outcome)
+
+    def _report_batch_outcome(self, outcome) -> None:
+        """Summarise a batch relocation in the status area and a message box."""
+        requested = int(getattr(outcome, "requested", 0))
+        relinked = int(getattr(outcome, "relinked", 0))
+        ambiguous = list(getattr(outcome, "ambiguous", ()))
+        not_found = list(getattr(outcome, "not_found", ()))
+        errors = list(getattr(outcome, "errors", ()))
+
+        summary = f"已重新定位 {relinked}/{requested} 个 PDF。"
+        if ambiguous or not_found:
+            summary += f" 仍有 {len(ambiguous) + len(not_found)} 个未能匹配。"
+        if errors:
+            summary += f" {len(errors)} 个写入失败。"
+        self.status_label.setText(summary)
+
+        if not ambiguous and not not_found and not errors:
+            QMessageBox.information(self, "批量重新定位完成", summary)
+            return
+
+        lines = [summary]
+        if ambiguous:
+            lines.append("")
+            lines.append(f"同名文件有多个（未修改，共 {len(ambiguous)} 个）：")
+            for entry in ambiguous[:5]:
+                lines.append(f"• {entry.node_name}：{Path(entry.stored_path).name}")
+            if len(ambiguous) > 5:
+                lines.append("…")
+        if not_found:
+            lines.append("")
+            lines.append(f"没有找到同名文件（共 {len(not_found)} 个）：")
+            for entry in not_found[:5]:
+                lines.append(f"• {entry.node_name}：{Path(entry.stored_path).name}")
+            if len(not_found) > 5:
+                lines.append("…")
+        if errors:
+            lines.append("")
+            lines.append(f"写入失败（共 {len(errors)} 个）：")
+            for entry, message in errors[:5]:
+                lines.append(f"• {entry.node_name}：{message}")
+            if len(errors) > 5:
+                lines.append("…")
+
+        QMessageBox.warning(self, "批量重新定位完成（部分未处理）", "\n".join(lines))
 
     def reveal_selected(self) -> None:
         selected = self.selected_entries()
